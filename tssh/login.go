@@ -33,7 +33,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -133,15 +132,17 @@ func getSshParam(args *sshArgs) (*sshParam, error) {
 		if userName != "" {
 			param.user = userName
 		} else {
-			currentUser, err := user.Current()
-			if err != nil {
-				return nil, fmt.Errorf("get current user failed: %v", err)
-			}
-			userName = currentUser.Username
-			if idx := strings.LastIndexByte(userName, '\\'); idx >= 0 {
-				userName = userName[idx+1:]
-			}
-			param.user = userName
+			// default user is "root" for compatibility with OpenSSH
+			param.user = "root"
+			//currentUser, err := user.Current()
+			//if err != nil {
+			//	return nil, fmt.Errorf("get current user failed: %v", err)
+			//}
+			//userName = currentUser.Username
+			//if idx := strings.LastIndexByte(userName, '\\'); idx >= 0 {
+			//	userName = userName[idx+1:]
+			//}
+			//param.user = userName
 		}
 	}
 
@@ -532,7 +533,8 @@ func getPasswordAuthMethod(args *sshArgs, host, user string) ssh.AuthMethod {
 
 	idx := 0
 	rememberPassword := false
-	return ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
+	var inputPassword string
+	authMethod := ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
 		idx++
 		if idx == 1 {
 			password := args.Option.get("Password")
@@ -551,8 +553,19 @@ func getPasswordAuthMethod(args *sshArgs, host, user string) ssh.AuthMethod {
 		if err != nil {
 			return "", err
 		}
-		return string(secret), nil
+		inputPassword = string(secret)
+		return inputPassword, nil
 	}), 3)
+
+	if !args.NoSave {
+		afterLoginFuncs = append(afterLoginFuncs, func() {
+			if inputPassword != "" {
+				savePasswordAfterLogin(args, inputPassword)
+			}
+		})
+	}
+
+	return authMethod
 }
 
 func readQuestionAnswerConfig(dest string, idx int, question string) string {
@@ -1251,6 +1264,10 @@ func sshLogin(args *sshArgs) (*sshClientSession, error) {
 	ss, udpMode, err := sshTcpLogin(args)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := saveHostToConfig(args, ss); err != nil {
+		warning("Failed to save host to config: %v", err)
 	}
 
 	if udpMode != kUdpModeNo {

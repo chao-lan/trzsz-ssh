@@ -60,6 +60,8 @@ type sshArgs struct {
 	Gateway        bool        `arg:"-g,--" help:"forwarding allows remote hosts to connect"`
 	Background     bool        `arg:"-f,--" help:"run as a background process, implies -n"`
 	NoCommand      bool        `arg:"-N,--" help:"do not execute a remote command"`
+	NoSave         bool        `arg:"-x,--" help:"do not save host to config file"`
+	Group          string      `arg:"--group" placeholder:"group_name" help:"specify group for the host"`
 	Port           int         `arg:"-p,--" placeholder:"port" help:"port to connect to on the remote host"`
 	LoginName      string      `arg:"-l,--" placeholder:"login_name" help:"the user to log in as on the remote machine"`
 	Identity       multiStr    `arg:"-i,--" placeholder:"identity_file" help:"identity (private key) for public key auth"`

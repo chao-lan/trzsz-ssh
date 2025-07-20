@@ -168,6 +168,7 @@ func TsshMain(argv []string) int {
 			return 3
 		}
 		dest, quit, err = chooseAlias("")
+		args.NoSave = false
 	} else {
 		dest, quit, err = predictDestination(args.Destination)
 	}
