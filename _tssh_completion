@@ -1,0 +1,72 @@
+#compdef tssh ssh
+
+# tssh/ssh completion for zsh
+_tssh() {
+    local context state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[show help message and exit]' \
+        '(-v --version)'{-v,--version}'[show program version number and exit]' \
+        '-V[show program version number and exit]' \
+        '-A[enable forwarding the ssh agent connection]' \
+        '-a[disable forwarding the ssh agent connection]' \
+        '-T[disable pseudo-terminal allocation]' \
+        '-t[force pseudo-terminal allocation]' \
+        '-4[forces ssh to use IPv4 addresses only]' \
+        '-6[forces ssh to use IPv6 addresses only]' \
+        '-g[forwarding allows remote hosts to connect]' \
+        '-f[run as a background process, implies -n]' \
+        '-N[do not execute a remote command]' \
+        '-x[do not save host to config file]' \
+        '-p[port to connect to on the remote host]:port:' \
+        '-l[the user to log in as on the remote machine]:login_name:' \
+        '-i[identity (private key) for public key auth]:identity_file:_files' \
+        '-c[cipher specification for encrypting the session]:cipher_spec:' \
+        '-F[an alternative per-user configuration file]:configfile:_files' \
+        '-J[jump hosts separated by comma characters]:destination:' \
+        '-o[options in the format used in ~/.ssh/config]:key=value:' \
+        '-W[forward stdin and stdout to host on port]:host\:port:' \
+        '-D[dynamic port forwarding ( socks5 proxy )]:bind_addr\:port:' \
+        '-L[local port forwarding]:bind_addr\:port\:host\:hostport:' \
+        '-R[remote port forwarding]:bind_addr\:port\:host\:hostport:' \
+        '-X[enables X11 forwarding]' \
+        '-Y[enables trusted X11 forwarding]' \
+        '--group[specify group for the host]:group_name:' \
+        '--reconnect[reconnect when background(-f) process exits]' \
+        '--dragfile[enable drag files and directories to upload]' \
+        '--tracelog[enable trzsz detect trace logs for debugging]' \
+        '--relay[force trzsz run as a relay on the jump server]' \
+        '--client[force trzsz run as a client on the jump server]' \
+        '--debug[verbose mode for debugging, same as ssh'\''s -vvv]' \
+        '--zmodem[enable zmodem lrzsz ( rz / sz ) feature]' \
+        '--dns[custom DNS server]:dns_server:' \
+        '--udp[ssh over UDP like mosh (default mode: QUIC)]' \
+        '--tsshd-path[tsshd absolute path on the server]:path:_files' \
+        '--new-host[add new host to configuration]' \
+        '--enc-secret[encode secret for configuration]' \
+        '--list-hosts[list all hosts in configuration]' \
+        '--install-trzsz[install trzsz to the remote server]' \
+        '--install-tsshd[install tsshd to the remote server]' \
+        '--install-path[install path, default: ~/.local/bin/]:path:_files' \
+        '--trzsz-version[install the specified version of trzsz]:version:' \
+        '--trzsz-bin-path[trzsz binary installation package path]:path:_files' \
+        '--tsshd-version[install the specified version of tsshd]:version:' \
+        '--tsshd-bin-path[tsshd binary installation package path]:path:_files' \
+        '--upload-file[upload the local file to remote server]:path:_files' \
+        '--download-path[the local saving path for downloading]:path:_files' \
+        '*:destination:_ssh_hosts' && return 0
+
+    return 1
+}
+
+# Function to get SSH hosts from config
+_ssh_hosts() {
+    local -a hosts
+    if [[ -f ~/.ssh/config ]]; then
+        hosts=(${(f)"$(grep -i '^host ' ~/.ssh/config | grep -v '[*?]' | awk '{print $2}')"})
+    fi
+    _describe 'ssh hosts' hosts
+}
+
+_tssh "$@"
