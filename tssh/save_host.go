@@ -40,6 +40,9 @@ func shouldSaveHost(args *sshArgs) bool {
 	return userConfig.autoSaveHost
 }
 
+var savedHosts = make(map[string]bool)
+var savedHostsMutex sync.Mutex
+
 func saveHostToConfig(args *sshArgs, session *sshClientSession) error {
 	if !shouldSaveHost(args) {
 		return nil
@@ -50,11 +53,30 @@ func saveHostToConfig(args *sshArgs, session *sshClientSession) error {
 		return fmt.Errorf("invalid destination: %s", args.Destination)
 	}
 
+	// Use port from -p argument if provided, otherwise use port from destination
+	if args.Port > 0 {
+		port = fmt.Sprintf("%d", args.Port)
+	}
+
+	// Prevent duplicate saves in the same session
+	savedHostsMutex.Lock()
+	defer savedHostsMutex.Unlock()
+
+	saveKey := fmt.Sprintf("%s:%s:%s:%s", user, host, port, args.Group)
+	if savedHosts[saveKey] {
+		return nil // Already saved in this session
+	}
+	savedHosts[saveKey] = true
+
+	debug("Attempting to save host: user=%s, host=%s, port=%s, group=%s", user, host, port, args.Group)
+
 	existingHost := findHostInConfig(host)
 	if existingHost != "" {
+		debug("Found existing host '%s', updating configuration", existingHost)
 		return updateHostInConfig(existingHost, user, host, port, args.Group)
 	}
 
+	debug("Host not found in config, adding new host")
 	return addHostToConfig(user, host, port, args.Group)
 }
 
@@ -62,8 +84,46 @@ func findHostInConfig(host string) string {
 	loadSshConfig()
 
 	for _, h := range userConfig.allHosts {
-		if h.Host == host {
+		// Check both Host and Alias for exact match
+		if h.Host == host || h.Alias == host {
 			return h.Alias
+		}
+	}
+
+	// Also check directly in the config file to catch any edge cases
+	configPath := getConfigPath()
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for i, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmedLine, "Host ") {
+			hostNames := strings.Fields(trimmedLine)[1:]
+			for _, name := range hostNames {
+				if name == host {
+					return name
+				}
+			}
+		}
+		// Check HostName within this host block
+		if strings.HasPrefix(trimmedLine, "HostName ") && i > 0 {
+			hostValue := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "HostName"))
+			if hostValue == host {
+				// Find the corresponding Host line above
+				for j := i - 1; j >= 0; j-- {
+					prevLine := strings.TrimSpace(lines[j])
+					if strings.HasPrefix(prevLine, "Host ") {
+						hostNames := strings.Fields(prevLine)[1:]
+						if len(hostNames) > 0 {
+							return hostNames[0]
+						}
+						break
+					}
+				}
+			}
 		}
 	}
 
@@ -82,6 +142,11 @@ func updateHostInConfig(alias, user, host, port, group string) error {
 	hostEndLine := len(lines)
 	inHostBlock := false
 
+	// Preserve existing configuration values
+	existingPort := ""
+	existingUser := ""
+	existingGroup := ""
+
 	for i, line := range lines {
 		trimmedLine := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmedLine, "Host ") {
@@ -97,6 +162,15 @@ func updateHostInConfig(alias, user, host, port, group string) error {
 					break
 				}
 			}
+		} else if inHostBlock {
+			// Parse existing configuration within the host block
+			if strings.HasPrefix(trimmedLine, "Port ") {
+				existingPort = strings.TrimSpace(strings.TrimPrefix(trimmedLine, "Port"))
+			} else if strings.HasPrefix(trimmedLine, "User ") {
+				existingUser = strings.TrimSpace(strings.TrimPrefix(trimmedLine, "User"))
+			} else if strings.HasPrefix(trimmedLine, "#!! GroupLabels ") {
+				existingGroup = strings.TrimSpace(strings.TrimPrefix(trimmedLine, "#!! GroupLabels"))
+			}
 		}
 	}
 
@@ -104,18 +178,32 @@ func updateHostInConfig(alias, user, host, port, group string) error {
 		return fmt.Errorf("host %s not found in config file", alias)
 	}
 
+	// Use new values if provided, otherwise keep existing ones
+	finalPort := port
+	if finalPort == "" {
+		finalPort = existingPort
+	}
+	finalUser := user
+	if finalUser == "" {
+		finalUser = existingUser
+	}
+	finalGroup := group
+	if finalGroup == "" {
+		finalGroup = existingGroup
+	}
+
 	var newLines []string
 	newLines = append(newLines, lines[:hostLine]...)
 	newLines = append(newLines, fmt.Sprintf("Host %s", alias))
 	newLines = append(newLines, fmt.Sprintf("    HostName %s", host))
-	if user != "" {
-		newLines = append(newLines, fmt.Sprintf("    User %s", user))
+	if finalUser != "" {
+		newLines = append(newLines, fmt.Sprintf("    User %s", finalUser))
 	}
-	if port != "" {
-		newLines = append(newLines, fmt.Sprintf("    Port %s", port))
+	if finalPort != "" {
+		newLines = append(newLines, fmt.Sprintf("    Port %s", finalPort))
 	}
-	if group != "" {
-		newLines = append(newLines, fmt.Sprintf("    #!! GroupLabels %s", group))
+	if finalGroup != "" {
+		newLines = append(newLines, fmt.Sprintf("    #!! GroupLabels %s", finalGroup))
 	}
 	newLines = append(newLines, lines[hostEndLine:]...)
 

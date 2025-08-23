@@ -212,6 +212,12 @@ func sshStart(args *sshArgs) (int, error) {
 	}
 	defer ss.Close()
 
+	// save host configuration after successful login
+	if err := saveHostToConfig(args, ss); err != nil {
+		// Log warning but don't fail the connection
+		warning("failed to save host configuration: %v", err)
+	}
+
 	// stdio forward
 	if args.StdioForward != "" {
 		var wg *sync.WaitGroup
