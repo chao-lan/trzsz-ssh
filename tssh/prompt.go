@@ -111,7 +111,7 @@ var normalShortcuts = []sshShortcuts{
 	{actionName: "Goto Home", globalKeys: []string{"Home"}, nonSearchKeys: []string{"g"}},
 	{actionName: "Goto  End", globalKeys: []string{"End "}, nonSearchKeys: []string{"G"}},
 	{actionName: "Delete   ", globalKeys: nil, nonSearchKeys: []string{"D"}},
-	{actionName: "Upload   ", globalKeys: nil, nonSearchKeys: []string{"U"}},
+	{actionName: "FileMgr  ", globalKeys: nil, nonSearchKeys: []string{"U"}},
 	{actionName: "EraseKeys", globalKeys: []string{"Ctrl+E"}, nonSearchKeys: []string{"e", "E"}},
 	{actionName: "TglSearch", globalKeys: []string{"/"}, searchKeys: []string{"Esc", "Enter"}},
 	{actionName: "Tgl  Help", globalKeys: []string{"?"}},

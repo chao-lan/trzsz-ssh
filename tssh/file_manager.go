@@ -52,6 +52,11 @@ type fileManagerTheme struct {
 	error      lipgloss.Style
 }
 
+const (
+	fileManagerAltScreenEnter = "\x1b[?1049h"
+	fileManagerAltScreenExit  = "\x1b[?1049l"
+)
+
 func newFileManagerTheme() fileManagerTheme {
 	return fileManagerTheme{
 		title:      getPromptLineStyle("14|bold"),
@@ -108,6 +113,10 @@ func runFileManager(client SshClient) error {
 		return err
 	}
 	defer resetStdin(state)
+	_, _ = os.Stderr.WriteString(fileManagerAltScreenEnter)
+	defer func() {
+		_, _ = os.Stderr.WriteString(fileManagerAltScreenExit)
+	}()
 	hideCursor(os.Stderr)
 	defer showCursor(os.Stderr)
 
@@ -127,7 +136,6 @@ func runFileManager(client SshClient) error {
 			model.message = ""
 		case isFileManagerQuitKey(key):
 			model.cancelled = true
-			_, _ = os.Stderr.WriteString("\x1b[H\x1b[2J")
 			return nil
 		case len(key) == 1 && key[0] == '/':
 			model.searching = true
