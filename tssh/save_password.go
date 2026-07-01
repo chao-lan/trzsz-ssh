@@ -36,9 +36,10 @@ func savePassword(args *sshArgs, password string) error {
 		return nil
 	}
 
-	user, host, port := parseDestination(args.Destination)
+	destination := getOriginalDestination(args)
+	user, host, port := parseDestination(destination)
 	if host == "" {
-		return fmt.Errorf("invalid destination: %s", args.Destination)
+		return fmt.Errorf("invalid destination: %s", destination)
 	}
 
 	secret, err := encodeSecret([]byte(password))
@@ -49,7 +50,7 @@ func savePassword(args *sshArgs, password string) error {
 	configPath := getPasswordConfigPath()
 	if configPath == "" {
 		// If no password save path is configured, save to SSH configuration file
-		return savePasswordToConfig(args.Destination, secret)
+		return savePasswordToConfig(destination, secret)
 	}
 
 	configDir := filepath.Dir(configPath)
@@ -294,7 +295,7 @@ func savePasswordAfterLogin(args *sshArgs, password string) {
 	}
 
 	// Only save when password really needs to be saved
-	if needsPasswordSave(args.Destination, password) {
+	if needsPasswordSave(getOriginalDestination(args), password) {
 		if err := savePassword(args, password); err != nil {
 			// Only log error, don't interrupt connection
 			warning("Failed to save password: %v", err)

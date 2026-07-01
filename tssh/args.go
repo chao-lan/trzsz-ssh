@@ -108,6 +108,13 @@ type sshArgs struct {
 	originalDest   string
 }
 
+func getOriginalDestination(args *sshArgs) string {
+	if args.originalDest != "" {
+		return args.originalDest
+	}
+	return args.Destination
+}
+
 func (sshArgs) Description() string {
 	return "trzsz-ssh(tssh): alternative ssh client with additional features to meet your needs.\n"
 }

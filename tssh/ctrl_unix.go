@@ -223,6 +223,27 @@ func (c *controlMaster) quit(exitCh <-chan struct{}) {
 	timer.Stop()
 }
 
+func appendOpenSSHDestinationArgs(cmdArgs []string, args *sshArgs) []string {
+	dest := getOriginalDestination(args)
+
+	user, host, port := parseDestination(dest)
+	switch {
+	case args.LoginName != "":
+		cmdArgs = append(cmdArgs, "-l", args.LoginName)
+	case user != "":
+		cmdArgs = append(cmdArgs, "-l", user)
+	}
+	if args.Port != 0 {
+		cmdArgs = append(cmdArgs, "-p", strconv.Itoa(args.Port))
+	} else if port != "" {
+		cmdArgs = append(cmdArgs, "-p", port)
+	}
+	if host != "" {
+		return append(cmdArgs, host)
+	}
+	return append(cmdArgs, dest)
+}
+
 func startControlMaster(param *sshParam, sshPath string) error {
 	cmdArgs := []string{"-T", "-oRemoteCommand=none",
 		"-oConnectTimeout=" + strconv.Itoa(int(getConnectTimeout(param.args)/time.Second))}
@@ -257,12 +278,6 @@ func startControlMaster(param *sshParam, sshPath string) error {
 		}
 	}
 
-	if args.LoginName != "" {
-		cmdArgs = append(cmdArgs, "-l", args.LoginName)
-	}
-	if args.Port != 0 {
-		cmdArgs = append(cmdArgs, "-p", strconv.Itoa(args.Port))
-	}
 	if args.CipherSpec != "" {
 		cmdArgs = append(cmdArgs, "-c", args.CipherSpec)
 	}
@@ -297,11 +312,7 @@ func startControlMaster(param *sshParam, sshPath string) error {
 		}
 	}
 
-	if args.originalDest != "" {
-		cmdArgs = append(cmdArgs, args.originalDest)
-	} else {
-		cmdArgs = append(cmdArgs, args.Destination)
-	}
+	cmdArgs = appendOpenSSHDestinationArgs(cmdArgs, args)
 	// 10 seconds is enough for tssh to connect
 	cmdArgs = append(cmdArgs, "echo ok; sleep 10")
 

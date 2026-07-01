@@ -112,6 +112,9 @@ func getSshParam(args *sshArgs) (*sshParam, error) {
 	param := &sshParam{args: args}
 
 	// login dest
+	if args.originalDest == "" {
+		args.originalDest = args.Destination
+	}
 	destUser, destHost, destPort := parseDestination(args.Destination)
 	if destHost == "" {
 		return nil, fmt.Errorf("invalid destination (empty host): %s", args.Destination)

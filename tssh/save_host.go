@@ -48,9 +48,10 @@ func saveHostToConfig(args *sshArgs, sshConn *sshConnection) error {
 		return nil
 	}
 
-	user, host, port := parseDestination(args.Destination)
+	destination := getOriginalDestination(args)
+	user, host, port := parseDestination(destination)
 	if host == "" {
-		return fmt.Errorf("invalid destination: %s", args.Destination)
+		return fmt.Errorf("invalid destination: %s", destination)
 	}
 
 	// Use port from -p argument if provided, otherwise use port from destination
