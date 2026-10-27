@@ -26,6 +26,7 @@ package tssh
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -34,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -41,7 +43,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/shlex"
 	"github.com/mitchellh/go-homedir"
 	"github.com/trzsz/ssh_config"
 )
@@ -57,6 +58,7 @@ func resolveHomeDir(path string) string {
 
 type sshHost struct {
 	Index         int `json:"-"`
+	Args          *sshArgs
 	Alias         string
 	Host          string
 	Port          string
@@ -69,16 +71,24 @@ type sshHost struct {
 	Selected      bool `json:"-"`
 }
 
+type sshConfig struct {
+	path   string
+	config *ssh_config.Config
+}
+
 type tsshConfig struct {
 	language              string
 	configPath            string
 	sysConfigPath         string
 	exConfigPath          string
-	useOpenSSHConfig      bool
+	useOpenSSHConfig      *bool
+	fuzzyHostSelection    *bool
+	allowedAutoUploadDirs string
 	defaultUploadPath     string
 	defaultDownloadPath   string
 	dragFileUploadCommand string
 	progressColorPair     string
+	zmodemAutoRename      string
 	promptThemeLayout     string
 	promptThemeColors     map[string]string
 	promptPageSize        uint8
@@ -86,55 +96,89 @@ type tsshConfig struct {
 	promptDetailItems     string
 	promptCursorIcon      string
 	promptSelectedIcon    string
+	promptSearchPointer   string
 	setTerminalTitle      string
 	autoSaveHost          bool
+	customDnsServer       string
 	loadConfig            sync.Once
 	loadExConfig          sync.Once
 	loadHosts             sync.Once
-	config                *ssh_config.Config
-	sysConfig             *ssh_config.Config
-	exConfig              *ssh_config.Config
+	config                *sshConfig
+	sysConfig             *sshConfig
+	exConfig              *sshConfig
 	loadDefaultColors     sync.Once
 	defaultThemeColors    map[string]string
 	allHosts              []*sshHost
 	wildcardPatterns      []*ssh_config.Pattern
 }
 
+func (c *tsshConfig) shouldUseOpenSSHConfig() bool {
+	return c.useOpenSSHConfig != nil && *c.useOpenSSHConfig
+}
+
+func (c *tsshConfig) shouldFuzzyHostSelection() bool {
+	return c.fuzzyHostSelection == nil || *c.fuzzyHostSelection
+}
+
 var userConfig *tsshConfig
 
-func getTsshConfigPath(forCreating bool) string {
+func getTsshConfigPath() []string {
+	var paths []string
+
 	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
 	if xdgConfigHome == "" {
 		xdgConfigHome = filepath.Join(userHomeDir, ".config")
 	}
 	xdgPath := filepath.Join(xdgConfigHome, "tssh/tssh.conf")
 	if isFileExist(xdgPath) {
-		return xdgPath
+		paths = append(paths, xdgPath)
 	}
+
 	homePath := filepath.Join(userHomeDir, ".tssh.conf")
 	if isFileExist(homePath) {
-		return homePath
+		paths = append(paths, homePath)
 	}
-	if forCreating {
-		if isDirExist(xdgConfigHome) {
-			cfgPath := filepath.Join(xdgConfigHome, "tssh")
-			if err := os.Mkdir(cfgPath, 0700); err != nil {
-				warning("create config path [%s] failed: %v", cfgPath, err)
-			}
-			return xdgPath
-		}
-		return homePath
+
+	if enableDebugLogging && len(paths) == 0 {
+		debug("%s or %s does not exist", xdgPath, homePath)
 	}
-	debug("%s or %s does not exist", xdgPath, homePath)
-	return ""
+
+	return paths
 }
 
-func parseTsshConfig() {
-	path := getTsshConfigPath(false)
-	if path == "" {
-		return
+func createTsshConfigPath() string {
+	xdgConfigHome := os.Getenv("XDG_CONFIG_HOME")
+	if xdgConfigHome == "" {
+		xdgConfigHome = filepath.Join(userHomeDir, ".config")
 	}
 
+	if isDirExist(xdgConfigHome) {
+		cfgPath := filepath.Join(xdgConfigHome, "tssh")
+		if !isDirExist(cfgPath) {
+			if err := os.Mkdir(cfgPath, 0700); err != nil {
+				warning("create config path [%s] failed: %v", cfgPath, err)
+				return filepath.Join(userHomeDir, ".tssh.conf")
+			}
+		}
+		return filepath.Join(cfgPath, "tssh.conf")
+	}
+
+	return filepath.Join(userHomeDir, ".tssh.conf")
+}
+
+func parseBoolValue(name, value string, defaultValue bool) *bool {
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		return ptr(true)
+	case "0", "false", "no", "off":
+		return ptr(false)
+	default:
+		warning("invalid boolean config [%s = %s], default to %v", name, value, defaultValue)
+		return ptr(defaultValue)
+	}
+}
+
+func loadTsshConfig(path string) {
 	file, err := os.Open(path)
 	if err != nil {
 		warning("open %s failed: %v", path, err)
@@ -166,11 +210,12 @@ func parseTsshConfig() {
 			userConfig.configPath = resolveHomeDir(value)
 		case name == "exconfigpath" && userConfig.exConfigPath == "":
 			userConfig.exConfigPath = resolveHomeDir(value)
-		case name == "useopensshconfig" && !userConfig.useOpenSSHConfig:
-			switch strings.ToLower(value) {
-			case "1", "true", "yes", "on":
-				userConfig.useOpenSSHConfig = true
-			}
+		case name == "useopensshconfig" && userConfig.useOpenSSHConfig == nil:
+			userConfig.useOpenSSHConfig = parseBoolValue(name, value, false)
+		case name == "fuzzyhostselection" && userConfig.fuzzyHostSelection == nil:
+			userConfig.fuzzyHostSelection = parseBoolValue(name, value, true)
+		case name == "allowedautouploaddirs" && userConfig.allowedAutoUploadDirs == "":
+			userConfig.allowedAutoUploadDirs = value
 		case name == "defaultuploadpath" && userConfig.defaultUploadPath == "":
 			userConfig.defaultUploadPath = resolveHomeDir(value)
 		case name == "defaultdownloadpath" && userConfig.defaultDownloadPath == "":
@@ -179,6 +224,8 @@ func parseTsshConfig() {
 			userConfig.dragFileUploadCommand = value
 		case name == "progresscolorpair" && userConfig.progressColorPair == "":
 			userConfig.progressColorPair = value
+		case name == "zmodemautorename" && userConfig.zmodemAutoRename == "":
+			userConfig.zmodemAutoRename = value
 		case name == "promptthemelayout" && userConfig.promptThemeLayout == "":
 			userConfig.promptThemeLayout = value
 		case name == "promptthemecolors" && len(userConfig.promptThemeColors) == 0:
@@ -200,11 +247,24 @@ func parseTsshConfig() {
 			userConfig.promptCursorIcon = value
 		case name == "promptselectedicon" && userConfig.promptSelectedIcon == "":
 			userConfig.promptSelectedIcon = value
+		case name == "promptsearchpointer" && userConfig.promptSearchPointer == "":
+			userConfig.promptSearchPointer = value
 		case name == "setterminaltitle" && userConfig.setTerminalTitle == "":
 			userConfig.setTerminalTitle = value
 		case name == "autosavehost":
 			userConfig.autoSaveHost = strings.ToLower(value) != "no" && strings.ToLower(value) != "false"
+		case name == "customdnsserver" && userConfig.customDnsServer == "":
+			userConfig.customDnsServer = value
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		warning("read config %q failed: %v", path, err)
+	}
+}
+
+func parseTsshConfig() {
+	for _, path := range getTsshConfigPath() {
+		loadTsshConfig(path)
 	}
 
 	if userConfig.promptCursorIcon != "" {
@@ -229,8 +289,14 @@ func showTsshConfig() {
 	if userConfig.exConfigPath != "" {
 		debug("ExConfigPath = %s", userConfig.exConfigPath)
 	}
-	if userConfig.useOpenSSHConfig {
-		debug("UseOpenSSHConfig = true")
+	if userConfig.useOpenSSHConfig != nil {
+		debug("UseOpenSSHConfig = %v", *userConfig.useOpenSSHConfig)
+	}
+	if userConfig.fuzzyHostSelection != nil {
+		debug("FuzzyHostSelection = %v", *userConfig.fuzzyHostSelection)
+	}
+	if userConfig.allowedAutoUploadDirs != "" {
+		debug("AllowedAutoUploadDirs = %s", userConfig.allowedAutoUploadDirs)
 	}
 	if userConfig.defaultUploadPath != "" {
 		debug("DefaultUploadPath = %s", userConfig.defaultUploadPath)
@@ -243,6 +309,9 @@ func showTsshConfig() {
 	}
 	if userConfig.progressColorPair != "" {
 		debug("ProgressColorPair = %s", userConfig.progressColorPair)
+	}
+	if userConfig.zmodemAutoRename != "" {
+		debug("ZmodemAutoRename = %s", userConfig.zmodemAutoRename)
 	}
 	if userConfig.promptThemeLayout != "" {
 		debug("PromptThemeLayout = %s", userConfig.promptThemeLayout)
@@ -265,10 +334,16 @@ func showTsshConfig() {
 	if userConfig.promptSelectedIcon != "" {
 		debug("PromptSelectedIcon = %s", userConfig.promptSelectedIcon)
 	}
+	if userConfig.promptSearchPointer != "" {
+		debug("PromptSearchPointer = %s", userConfig.promptSearchPointer)
+	}
 	if userConfig.setTerminalTitle != "" {
 		debug("SetTerminalTitle = %s", userConfig.setTerminalTitle)
 	}
 	debug("AutoSaveHost = %v", userConfig.autoSaveHost)
+	if userConfig.customDnsServer != "" {
+		debug("CustomDnsServer = %s", userConfig.customDnsServer)
+	}
 }
 
 func initUserConfig(configFile string) (err error) {
@@ -298,7 +373,7 @@ func initUserConfig(configFile string) (err error) {
 		if runtime.GOOS != "windows" {
 			userConfig.sysConfigPath = "/etc/ssh/ssh_config"
 		}
-	} else if strings.ToLower(userConfig.configPath) == "none" {
+	} else if strings.EqualFold(userConfig.configPath, "none") {
 		userConfig.configPath = ""
 	}
 
@@ -309,7 +384,7 @@ func initUserConfig(configFile string) (err error) {
 	return nil
 }
 
-func loadConfig(path string, system bool) *ssh_config.Config {
+func loadConfig(path string, system bool) *sshConfig {
 	file, err := os.Open(path)
 	if err != nil {
 		warning("open config [%s] failed: %v", path, err)
@@ -329,15 +404,11 @@ func loadConfig(path string, system bool) *ssh_config.Config {
 		return nil
 	}
 	debug("decode config [%s] success", path)
-	return config
+	return &sshConfig{path, config}
 }
 
 func (c *tsshConfig) doLoadConfig() {
 	c.loadConfig.Do(func() {
-		ssh_config.SetDefault("LogLevel", "")
-		ssh_config.SetDefault("IdentityFile", "")
-		ssh_config.SetDefault("User", "root")
-
 		if c.configPath == "" {
 			debug("no ssh configuration file path")
 			return
@@ -368,9 +439,30 @@ func (c *tsshConfig) doLoadExConfig() {
 	})
 }
 
-func getConfig(alias, key string) string {
-	if userConfig.useOpenSSHConfig {
-		if cfg := getOpenSSHEffectiveConfig(alias, nil, "", ""); cfg != nil {
+func getCfg(alias, key string, cfgs ...*sshConfig) string {
+	for _, cfg := range cfgs {
+		if cfg == nil || cfg.config == nil {
+			continue
+		}
+
+		value, err := cfg.config.Get(alias, key)
+
+		if err != nil {
+			warning("get config [%s] from [%s] for [%s] failed: %v", key, cfg.path, alias, err)
+			continue
+		}
+
+		if value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func getConfig(args *sshArgs, key string) string {
+	if userConfig.shouldUseOpenSSHConfig() {
+		if cfg := getEffectiveConfig(args); cfg != nil {
 			if value := cfg.get(key); value != "" {
 				return value
 			}
@@ -379,32 +471,51 @@ func getConfig(alias, key string) string {
 
 	userConfig.doLoadConfig()
 
-	if userConfig.config != nil {
-		value, err := userConfig.config.Get(alias, key)
-		if err != nil {
-			warning("get user config [%s] for [%s] failed: %v", key, alias, err)
-		} else if value != "" {
+	value := getCfg(args.Destination, key, userConfig.config, userConfig.sysConfig)
+	if value != "" {
+		return value
+	}
+
+	if args.canonicalDest != "" {
+		if value := getCfg(args.canonicalDest, key, userConfig.config, userConfig.sysConfig); value != "" {
 			return value
 		}
 	}
 
-	if userConfig.sysConfig != nil {
-		value, err := userConfig.sysConfig.Get(alias, key)
-		if err != nil {
-			warning("get sys config [%s] for [%s] failed: %v", key, alias, err)
-		} else if value != "" {
-			return value
-		}
+	// Preserve the fork's default login user after upstream removed config defaults.
+	if strings.EqualFold(key, "User") {
+		return "root"
 	}
 
-	return ssh_config.Default(key)
+	return ""
 }
 
-func getConfigSplits(alias, key string) []string {
-	if userConfig.useOpenSSHConfig {
-		if cfg := getOpenSSHEffectiveConfig(alias, nil, "", ""); cfg != nil {
+func getCfgSplits(alias, key string, cfgs ...*sshConfig) []string {
+	for _, cfg := range cfgs {
+		if cfg == nil || cfg.config == nil {
+			continue
+		}
+
+		values, err := cfg.config.GetSplits(alias, key)
+
+		if err != nil {
+			warning("get config splits [%s] from [%s] for [%s] failed: %v", key, cfg.path, alias, err)
+			continue
+		}
+
+		if len(values) > 0 {
+			return values
+		}
+	}
+
+	return nil
+}
+
+func getConfigSplits(args *sshArgs, key string) []string {
+	if userConfig.shouldUseOpenSSHConfig() {
+		if cfg := getEffectiveConfig(args); cfg != nil {
 			if value := cfg.get(key); value != "" {
-				values, err := shlex.Split(value)
+				values, err := ssh_config.SplitConfigValue(key, value)
 				if err != nil {
 					warning("split effective config [%s] value [%s] failed: %v", key, value, err)
 				} else if len(values) > 0 {
@@ -416,39 +527,44 @@ func getConfigSplits(alias, key string) []string {
 
 	userConfig.doLoadConfig()
 
-	if userConfig.config != nil {
-		values, err := userConfig.config.GetSplits(alias, key)
-		if err != nil {
-			warning("get user config splits [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(values) > 0 {
-			return values
-		}
+	values := getCfgSplits(args.Destination, key, userConfig.config, userConfig.sysConfig)
+	if len(values) > 0 {
+		return values
 	}
 
-	if userConfig.sysConfig != nil {
-		values, err := userConfig.sysConfig.GetSplits(alias, key)
-		if err != nil {
-			warning("get sys config splits [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(values) > 0 {
-			return values
-		}
-	}
-
-	if value := ssh_config.Default(key); value != "" {
-		values, err := shlex.Split(value)
-		if err != nil {
-			warning("split default [%s] value [%s] failed: %v", key, value, err)
-		} else if len(values) > 0 {
-			return values
-		}
+	if args.canonicalDest != "" {
+		return getCfgSplits(args.canonicalDest, key, userConfig.config, userConfig.sysConfig)
 	}
 
 	return nil
 }
 
-func getAllConfig(alias, key string) []string {
-	if userConfig.useOpenSSHConfig {
-		if cfg := getOpenSSHEffectiveConfig(alias, nil, "", ""); cfg != nil {
+func getAllCfg(alias, key string, cfgs ...*sshConfig) []string {
+	var values []string
+
+	for _, cfg := range cfgs {
+		if cfg == nil || cfg.config == nil {
+			continue
+		}
+
+		vals, err := cfg.config.GetAll(alias, key)
+
+		if err != nil {
+			warning("get all config [%s] from [%s] for [%s] failed: %v", key, cfg.path, alias, err)
+			continue
+		}
+
+		if len(vals) > 0 {
+			values = append(values, vals...)
+		}
+	}
+
+	return values
+}
+
+func getAllConfig(args *sshArgs, key string) []string {
+	if userConfig.shouldUseOpenSSHConfig() {
+		if cfg := getEffectiveConfig(args); cfg != nil {
 			if values := cfg.getAll(key); len(values) > 0 {
 				return values
 			}
@@ -457,39 +573,47 @@ func getAllConfig(alias, key string) []string {
 
 	userConfig.doLoadConfig()
 
-	var values []string
-	if userConfig.config != nil {
-		vals, err := userConfig.config.GetAll(alias, key)
-		if err != nil {
-			warning("get all user config [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(vals) > 0 {
+	values := getAllCfg(args.Destination, key, userConfig.config, userConfig.sysConfig)
+
+	if args.canonicalDest != "" {
+		vals := getAllCfg(args.canonicalDest, key, userConfig.config, userConfig.sysConfig)
+		if len(vals) > 0 {
 			values = append(values, vals...)
 		}
-	}
-	if userConfig.sysConfig != nil {
-		vals, err := userConfig.sysConfig.GetAll(alias, key)
-		if err != nil {
-			warning("get all sys config [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(vals) > 0 {
-			values = append(values, vals...)
-		}
-	}
-	if len(values) > 0 {
-		return values
 	}
 
-	if value := ssh_config.Default(key); value != "" {
-		values = append(values, value)
-	}
 	return values
 }
 
-func getAllConfigSplits(alias, key string) []string {
-	if userConfig.useOpenSSHConfig {
-		if cfg := getOpenSSHEffectiveConfig(alias, nil, "", ""); cfg != nil {
+func getAllCfgSplits(alias, key string, cfgs ...*sshConfig) []string {
+	var values []string
+
+	for _, cfg := range cfgs {
+		if cfg == nil || cfg.config == nil {
+			continue
+		}
+
+		vals, err := cfg.config.GetAllSplits(alias, key)
+
+		if err != nil {
+			warning("get all config splits [%s] from [%s] for [%s] failed: %v", key, cfg.path, alias, err)
+			continue
+		}
+
+		if len(vals) > 0 {
+			values = append(values, vals...)
+		}
+	}
+
+	return values
+}
+
+func getAllConfigSplits(args *sshArgs, key string) []string {
+	if userConfig.shouldUseOpenSSHConfig() {
+		if cfg := getEffectiveConfig(args); cfg != nil {
 			var values []string
 			for _, value := range cfg.getAll(key) {
-				vals, err := shlex.Split(value)
+				vals, err := ssh_config.SplitConfigValue(key, value)
 				if err != nil {
 					warning("split effective config [%s] value [%s] failed: %v", key, value, err)
 				} else if len(vals) > 0 {
@@ -504,87 +628,89 @@ func getAllConfigSplits(alias, key string) []string {
 
 	userConfig.doLoadConfig()
 
-	var values []string
-	if userConfig.config != nil {
-		vals, err := userConfig.config.GetAllSplits(alias, key)
-		if err != nil {
-			warning("get all user config splits [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(vals) > 0 {
+	values := getAllCfgSplits(args.Destination, key, userConfig.config, userConfig.sysConfig)
+
+	if args.canonicalDest != "" {
+		vals := getAllCfgSplits(args.canonicalDest, key, userConfig.config, userConfig.sysConfig)
+		if len(vals) > 0 {
 			values = append(values, vals...)
 		}
-	}
-	if userConfig.sysConfig != nil {
-		vals, err := userConfig.sysConfig.GetAllSplits(alias, key)
-		if err != nil {
-			warning("get all sys config splits [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(vals) > 0 {
-			values = append(values, vals...)
-		}
-	}
-	if len(values) > 0 {
-		return values
 	}
 
-	if value := ssh_config.Default(key); value != "" {
-		vals, err := shlex.Split(value)
-		if err != nil {
-			warning("split default [%s] value [%s] failed: %v", key, value, err)
-		} else if len(vals) > 0 {
-			values = append(values, vals...)
-		}
-	}
 	return values
 }
 
-func getExConfig(alias, key string) string {
+func getExConfig(args *sshArgs, key string) string {
+	userConfig.doLoadConfig()
 	userConfig.doLoadExConfig()
 
-	if userConfig.exConfig != nil {
-		value, err := userConfig.exConfig.Get(alias, key)
-		if err != nil {
-			warning("get extended config [%s] for [%s] failed: %v", key, alias, err)
-		} else if value != "" {
-			debug("get extended config [%s] for [%s] success", key, alias)
+	value := getCfg(args.Destination, key, userConfig.exConfig, userConfig.config, userConfig.sysConfig)
+
+	if value != "" {
+		debug("get extended config [%s] for [%s] success", key, args.Destination)
+		return value
+	}
+
+	if args.canonicalDest != "" {
+		value := getCfg(args.canonicalDest, key, userConfig.exConfig, userConfig.config, userConfig.sysConfig)
+		if value != "" {
+			debug("get extended config [%s] for [%s] success", key, args.canonicalDest)
 			return value
 		}
 	}
 
-	if value := getConfig(alias, key); value != "" {
-		debug("get extended config [%s] for [%s] success", key, alias)
-		return value
-	}
-
-	debug("no extended config [%s] for [%s]", key, alias)
+	debug("no extended config [%s] for [%s]", key, args.Destination)
 	return ""
 }
 
-func getAllExConfig(alias, key string) []string {
+func getAllExConfig(args *sshArgs, key string, extend bool) []string {
+	if userConfig.shouldUseOpenSSHConfig() && !extend {
+		return getAllConfig(args, key)
+	}
+
+	userConfig.doLoadConfig()
 	userConfig.doLoadExConfig()
 
-	var values []string
-	if userConfig.exConfig != nil {
-		vals, err := userConfig.exConfig.GetAll(alias, key)
-		if err != nil {
-			warning("get all extended config [%s] for [%s] failed: %v", key, alias, err)
-		} else if len(vals) > 0 {
+	values := getAllCfg(args.Destination, key, userConfig.exConfig, userConfig.config, userConfig.sysConfig)
+
+	if enableDebugLogging && extend && len(values) > 0 {
+		debug("get all extended config [%s] for [%s] success", key, args.Destination)
+	}
+
+	if args.canonicalDest != "" {
+		vals := getAllCfg(args.canonicalDest, key, userConfig.exConfig, userConfig.config, userConfig.sysConfig)
+		if len(vals) > 0 {
+			if enableDebugLogging && extend {
+				debug("get all extended config [%s] for [%s] success", key, args.canonicalDest)
+			}
 			values = append(values, vals...)
 		}
 	}
-	if vals := getAllConfig(alias, key); len(vals) > 0 {
-		values = append(values, vals...)
+
+	if enableDebugLogging && extend && len(values) == 0 {
+		debug("no extended config [%s] for [%s]", key, args.Destination)
 	}
 
 	return values
 }
 
-func getAllHosts() []*sshHost {
+func getAllHosts(args *sshArgs) []*sshHost {
+	userConfig.doLoadConfig()
+	userConfig.doLoadExConfig()
+
+	if enableDebugLogging && tmuxDebugPaneWriter == nil {
+		enableDebugLogging = false
+		defer func() { enableDebugLogging = true }()
+	}
+
 	userConfig.loadHosts.Do(func() {
 		userConfig.doLoadConfig()
+		seen := make(map[string]bool)
 		if userConfig.config != nil {
-			userConfig.allHosts = append(userConfig.allHosts, recursiveGetHosts(userConfig.config.Hosts)...)
+			userConfig.allHosts = append(userConfig.allHosts, recursiveGetHosts(args, userConfig.config.config.Hosts, seen)...)
 		}
 		if userConfig.sysConfig != nil {
-			userConfig.allHosts = append(userConfig.allHosts, recursiveGetHosts(userConfig.sysConfig.Hosts)...)
+			userConfig.allHosts = append(userConfig.allHosts, recursiveGetHosts(args, userConfig.sysConfig.config.Hosts, seen)...)
 		}
 		for i, host := range userConfig.allHosts {
 			host.Index = i
@@ -596,53 +722,78 @@ func getAllHosts() []*sshHost {
 }
 
 // recursiveGetHosts recursive get hosts (contains include file's hosts)
-func recursiveGetHosts(cfgHosts []*ssh_config.Host) []*sshHost {
+func recursiveGetHosts(args *sshArgs, cfgHosts []*ssh_config.Host, seen map[string]bool) []*sshHost {
 	var hosts []*sshHost
 	for _, host := range cfgHosts {
 		for _, node := range host.Nodes {
 			if include, ok := node.(*ssh_config.Include); ok && include != nil {
 				for _, config := range include.GetFiles() {
 					if config != nil {
-						hosts = append(hosts, recursiveGetHosts(config.Hosts)...)
+						hosts = append(hosts, recursiveGetHosts(args, config.Hosts, seen)...)
 					}
 				}
 			}
 		}
-		hosts = appendPromptHosts(hosts, host)
+		hosts = appendPromptHosts(args, hosts, seen, host)
 	}
 	return hosts
 }
 
-func appendPromptHosts(hosts []*sshHost, cfgHosts ...*ssh_config.Host) []*sshHost {
+func appendPromptHosts(oriArgs *sshArgs, hosts []*sshHost, seen map[string]bool, cfgHosts ...*ssh_config.Host) []*sshHost {
 	for _, host := range cfgHosts {
 		for _, pattern := range host.Patterns {
 			alias := pattern.String()
+
+			if seen[alias] {
+				continue
+			}
+			seen[alias] = true
+
 			if strings.ContainsRune(alias, '*') || strings.ContainsRune(alias, '?') {
 				if alias != "*" && !pattern.Not() {
 					userConfig.wildcardPatterns = append(userConfig.wildcardPatterns, pattern)
 				}
 				continue
 			}
-			if strings.ToLower(getConfig(alias, "HideHost")) == "yes" { // treat as not extended config
+
+			args := *oriArgs
+			args.Destination, args.originalDest = alias, alias
+
+			if !userConfig.shouldUseOpenSSHConfig() {
+				if v := getOptionConfig(&args, "CanonicalizeHostname"); strings.EqualFold(v, "always") || strings.EqualFold(v, "yes") {
+					if host, err := canonicalizeHost(&args, alias); err == nil && host != alias {
+						args.canonicalDest = host
+					}
+				}
+			}
+
+			if strings.EqualFold(getExOptionConfig(&args, "HideHost"), "yes") {
 				continue
 			}
+
+			host := getOptionConfig(&args, "HostName")
+			if host == "" && args.canonicalDest != "" {
+				host = args.canonicalDest
+			}
+
 			hosts = append(hosts, &sshHost{
+				Args:          &args,
 				Alias:         alias,
-				Host:          getConfig(alias, "HostName"),
-				Port:          getConfig(alias, "Port"),
-				User:          getConfig(alias, "User"),
-				IdentityFile:  getConfig(alias, "IdentityFile"),
-				ProxyCommand:  getConfig(alias, "ProxyCommand"),
-				ProxyJump:     getConfig(alias, "ProxyJump"),
-				RemoteCommand: getConfig(alias, "RemoteCommand"),
-				GroupLabels:   getGroupLabels(alias),
+				Host:          host,
+				Port:          getOptionConfig(&args, "Port"),
+				User:          getOptionConfig(&args, "User"),
+				IdentityFile:  getOptionConfig(&args, "IdentityFile"),
+				ProxyCommand:  getOptionConfig(&args, "ProxyCommand"),
+				ProxyJump:     getOptionConfig(&args, "ProxyJump"),
+				RemoteCommand: getOptionConfig(&args, "RemoteCommand"),
+				GroupLabels:   getGroupLabels(&args),
 			})
 		}
 	}
 	return hosts
 }
 
-func getGroupLabels(alias string) string {
+func getGroupLabels(args *sshArgs) string {
 	var groupLabels []string
 	addGroupLabel := func(groupLabel string) {
 		if slices.Contains(groupLabels, groupLabel) {
@@ -650,7 +801,7 @@ func getGroupLabels(alias string) string {
 		}
 		groupLabels = append(groupLabels, groupLabel)
 	}
-	for _, groupLabel := range getAllExConfig(alias, "GroupLabels") {
+	for _, groupLabel := range getAllExOptionConfig(args, "GroupLabels", true) {
 		for label := range strings.FieldsSeq(groupLabel) {
 			addGroupLabel(label)
 		}
@@ -662,35 +813,35 @@ func getOptionConfig(args *sshArgs, option string) string {
 	if value := args.Option.get(option); value != "" {
 		return value
 	}
-	return getConfig(args.Destination, option)
+	return getConfig(args, option)
 }
 
 func getOptionConfigSplits(args *sshArgs, option string) []string {
 	if value := args.Option.get(option); value != "" {
-		values, err := shlex.Split(value)
+		values, err := ssh_config.SplitConfigValue(option, value)
 		if err != nil {
 			warning("split option [%s] value [%s] failed: %v", option, value, err)
 		}
 		return values
 	}
-	return getConfigSplits(args.Destination, option)
+	return getConfigSplits(args, option)
 }
 
 func getAllOptionConfig(args *sshArgs, option string) []string {
-	return append(args.Option.getAll(option), getAllConfig(args.Destination, option)...)
+	return append(args.Option.getAll(option), getAllConfig(args, option)...)
 }
 
 func getAllOptionConfigSplits(args *sshArgs, option string) []string {
 	var all []string
 	for _, value := range args.Option.getAll(option) {
-		values, err := shlex.Split(value)
+		values, err := ssh_config.SplitConfigValue(option, value)
 		if err != nil {
 			warning("split option [%s] value [%s] failed: %v", option, value, err)
 		} else if len(values) > 0 {
 			all = append(all, values...)
 		}
 	}
-	values := getAllConfigSplits(args.Destination, option)
+	values := getAllConfigSplits(args, option)
 	if len(values) > 0 {
 		all = append(all, values...)
 	}
@@ -701,11 +852,11 @@ func getExOptionConfig(args *sshArgs, option string) string {
 	if value := args.Option.get(option); value != "" {
 		return value
 	}
-	return getExConfig(args.Destination, option)
+	return getExConfig(args, option)
 }
 
-func getAllExOptionConfig(args *sshArgs, option string) []string {
-	return append(args.Option.getAll(option), getAllExConfig(args.Destination, option)...)
+func getAllExOptionConfig(args *sshArgs, option string, extend bool) []string {
+	return append(args.Option.getAll(option), getAllExConfig(args, option, extend)...)
 }
 
 var secretEncodeKey = []byte("THE_UNSAFE_KEY_FOR_ENCODING_ONLY")
@@ -750,15 +901,55 @@ func decodeSecret(secret string) (string, error) {
 	return string(plainSecret), nil
 }
 
-func getSecretConfig(alias, key string) string {
-	if value := getExConfig(alias, "enc"+key); value != "" {
+func execSecretCommand(param *sshParam, command string) string {
+	expanded, err := expandTokens(command, param, "%hnpr")
+	if err != nil {
+		warning("expand secret command [%s] failed: %v", command, err)
+		return ""
+	}
+
+	argv, err := splitCommandLine(expanded)
+	if err != nil || len(argv) == 0 {
+		warning("split secret command [%s] failed: %v", expanded, err)
+		return ""
+	}
+	if enableDebugLogging {
+		for i, arg := range argv {
+			debug("secret command argv[%d] = %s", i, arg)
+		}
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		if errBuf.Len() > 0 {
+			warning("exec secret command [%s] failed: %v, %s", expanded, err, strings.TrimSpace(errBuf.String()))
+		} else {
+			warning("exec secret command [%s] failed: %v", expanded, err)
+		}
+		return ""
+	}
+	if enableDebugLogging && errBuf.Len() > 0 {
+		debug("secret command stderr output: %s", errBuf.String())
+	}
+	return strings.TrimSpace(outBuf.String())
+}
+
+func getSecretConfig(param *sshParam, key string) string {
+	if value := getExConfig(param.args, "enc"+key); value != "" {
 		secret, err := decodeSecret(value)
 		if err == nil && secret != "" {
 			return secret
 		}
 		warning("decode secret [%s] failed: %v", value, err)
 	}
-	return getExConfig(alias, key)
+	if command := getExConfig(param.args, key+"Command"); command != "" {
+		if secret := execSecretCommand(param, command); secret != "" {
+			return secret
+		}
+	}
+	return getExConfig(param.args, key)
 }
 
 func getPromptPageSize() int {

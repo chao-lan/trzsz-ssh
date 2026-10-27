@@ -44,10 +44,10 @@ func showConnectionLostNotif(client *sshUdpClient) {
 	client.notifInterceptor.tmuxFlag.Store(tmux)
 	client.notifInterceptor.cursorPos.Store(nil)
 
-	client.debug("start intercepting user input")
+	client.debug("start intercepting user input and server output")
 	client.notifInterceptor.interceptFlag.Store(true)
 	defer func() {
-		client.debug("releasing intercepted user input")
+		client.debug("releasing intercepted user input and server output")
 		client.notifInterceptor.filterESC6n.Store(true)
 		client.notifInterceptor.interceptFlag.Store(false)
 	}()
@@ -82,10 +82,13 @@ func showConnectionLostNotif(client *sshUdpClient) {
 
 	_, _ = doWithTimeout(func() (int, error) {
 		client.debug("requesting screen redraw")
-		client.sshConn.Load().session.RedrawScreen()
+		if err := client.sshConn.Load().session.RedrawScreen(true); err != nil {
+			client.debug("redraw screen failed: %v", err)
+		}
 		client.debug("screen redraw completed")
 		return 0, nil
 	}, client.reconnectTimeout)
+
 	notif.renderView(false, false)
 }
 
@@ -96,11 +99,12 @@ func interactWithUserInput(client *sshUdpClient) {
 			if !ok {
 				return
 			}
-			switch ch {
-			case '\x01': // ctrl + a
+			switch {
+			case ch == '\x01': // Ctrl+A toggles full notifications.
 				client.notifInterceptor.showFullNotif.Store(!client.notifInterceptor.showFullNotif.Load())
-			case '\x03': // ctrl + c
-				client.exit(kExitCodeUdpCtrlC, "Exit due to connection was lost and Ctrl+C was pressed")
+			case client.notifInterceptor.exitKey != 0 && ch == client.notifInterceptor.exitKey:
+				client.sshConn.Load().forceExit(kExitCodeUdpCtrlC,
+					fmt.Sprintf("lost connection and %s keystroke", udpReconnectExitKeyName(client.notifInterceptor.exitKey)))
 				return
 			}
 		case <-time.After(200 * time.Millisecond):
@@ -211,7 +215,7 @@ func (m *notifModel) renderView(exiting, redrawing bool) {
 
 	if m.client.notifInterceptor.noticeOnTop {
 		if m.cursorPos != nil {
-			buf.WriteString(fmt.Sprintf("\x1b[%sH", *m.cursorPos))
+			fmt.Fprintf(&buf, "\x1b[%sH", *m.cursorPos)
 		} else {
 			buf.WriteString(ansi.RestoreCurrentCursorPosition)
 		}
@@ -273,8 +277,15 @@ func (m *notifModel) getView(redrawing bool) string {
 			buf.WriteByte('\n')
 			buf.WriteString(m.errorStyle.Render("Last reconnect error: " + err.Error()))
 		}
-		buf.WriteByte('\n')
-		buf.WriteString(m.tipsStyle.Render("No longer need to reconnect to the server? Press Ctrl+C to exit."))
+		if m.client.notifInterceptor.exitKey != 0 {
+			verb := "exit"
+			if m.client.attachMode {
+				verb = "detach"
+			}
+			buf.WriteString(m.tipsStyle.Render(fmt.Sprintf(
+				"\nNo longer need to reconnect to the server? Press %s to %s.",
+				udpReconnectExitKeyName(m.client.notifInterceptor.exitKey), verb)))
+		}
 	}
 
 	return lipgloss.PlaceHorizontal(m.getWidth(), lipgloss.Center, m.borderStyle.Render(buf.String()))
@@ -289,8 +300,6 @@ func (m *notifModel) getWidth() int {
 
 type notifInterceptor struct {
 	client        *sshUdpClient
-	inputBufChan  chan []byte
-	inputBufChMu  sync.Mutex
 	noticeOnTop   bool
 	showFullNotif atomic.Bool
 	interceptFlag atomic.Bool
@@ -300,6 +309,7 @@ type notifInterceptor struct {
 	tmuxPaneId    atomic.Pointer[string]
 	tmuxLeftBuf   []byte
 	filterESC6n   atomic.Bool
+	exitKey       byte // Exit key during UDP reconnect; 0 means disabled.
 }
 
 func (ni *notifInterceptor) handleUserInput(input []byte) {
@@ -316,7 +326,7 @@ func (ni *notifInterceptor) handleUserInput(input []byte) {
 		var paneId string
 		buf, ni.tmuxLeftBuf, paneId, detach = handleAndDecodeTmuxInput(buf)
 		if detach {
-			ni.client.sshConn.Load().forceExit(kExitCodeTmuxDetach, "Exit due to connection was lost and detach from tmux integration")
+			ni.client.sshConn.Load().forceExit(kExitCodeTmuxDetach, "lost connection and detachment from tmux integration")
 			return
 		}
 		if paneId == "" {
@@ -349,18 +359,12 @@ func (ni *notifInterceptor) handleUserInput(input []byte) {
 }
 
 func (ni *notifInterceptor) forwardInput(reader io.Reader, writer io.WriteCloser) {
-	ni.inputBufChan = make(chan []byte, 10)
-	defer func() {
-		close(ni.interceptChan)
-		ni.inputBufChMu.Lock()
-		defer ni.inputBufChMu.Unlock()
-		close(ni.inputBufChan)
-		ni.inputBufChan = nil
-	}()
+	inputBufChan := make(chan []byte, 10)
+	defer close(inputBufChan)
 
 	go func() {
 		defer func() { _ = writer.Close() }()
-		for buf := range ni.inputBufChan {
+		for buf := range inputBufChan {
 			if err := writeAll(writer, buf); err != nil {
 				warning("udp forward input failed: %v", err)
 			}
@@ -384,13 +388,20 @@ func (ni *notifInterceptor) forwardInput(reader io.Reader, writer io.WriteCloser
 				copy(buf, buffer[:n])
 			}
 			if ni.filterESC6n.Load() {
+				// Cursor position reports are not considered real user input. Ignore them and keep filtering.
+				if n > 5 && buf[0] == '\x1b' && buf[1] == '[' && buf[n-1] == 'R' { // cursor pos
+					if enableDebugLogging {
+						ni.client.debug("ignored cursor position report: %q", string(buf))
+					}
+					continue
+				}
 				// stop filtering ESC[6n once the user provides real input and starts interacting with the remote program again.
 				ni.filterESC6n.Store(false)
 			}
 		out:
 			for {
 				select {
-				case ni.inputBufChan <- buf:
+				case inputBufChan <- buf:
 					break out
 				default:
 					if ni.interceptFlag.Load() {
@@ -407,56 +418,21 @@ func (ni *notifInterceptor) forwardInput(reader io.Reader, writer io.WriteCloser
 	}
 }
 
-func (ni *notifInterceptor) discardPendingInput(discardMarker []byte) []byte {
-	ni.inputBufChMu.Lock()
-	defer ni.inputBufChMu.Unlock()
-	if ni.inputBufChan == nil {
-		return nil
-	}
-
-	if ni.client == ni.client.sshConn.Load().client { // the last ssh client is udp client
-		defer func() { ni.inputBufChan <- discardMarker }()
-	}
-
-	if len(ni.inputBufChan) == 0 {
-		return nil
-	}
-
-	var input []byte
-out:
-	for {
-		select {
-		case buf := <-ni.inputBufChan:
-			input = append(input, buf...)
-		case <-time.After(21 * time.Millisecond):
-			break out
-		}
-	}
-
-	return input
-}
-
 func (ni *notifInterceptor) forwardOutput(reader io.Reader, writer io.WriteCloser) {
 	defer func() { _ = writer.Close() }()
-	cache := &outputCache{client: ni.client}
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			if ni.interceptFlag.Load() {
-				cache.appendOutput(buffer[:n])
+				ni.client.debug("intercepted and discarded server output %d bytes", n)
 			} else {
-				if len(cache.chunks) > 0 {
-					if err := cache.flushOutput(writer); err != nil {
-						break
-					}
-				}
 				buf := buffer[:n]
 				if ni.filterESC6n.Load() {
 					if enableDebugLogging {
 						n := bytes.Count(buf, []byte("\x1b[6n"))
 						if n > 0 {
-							ni.client.debug("filtered %d ESC[6n sequence(s) from live output", n)
+							ni.client.debug("filtered %d ESC[6n sequence(s) from server output", n)
 						}
 					}
 					buf = bytes.ReplaceAll(buf, []byte("\x1b[6n"), []byte(""))
@@ -470,60 +446,54 @@ func (ni *notifInterceptor) forwardOutput(reader io.Reader, writer io.WriteClose
 			break
 		}
 	}
-	_ = cache.flushOutput(writer)
 }
 
-type outputCache struct {
-	client *sshUdpClient
-	chunks [][]byte
+const defaultUdpReconnectExitKey byte = '\x04' // Ctrl+D
+
+// parseUdpReconnectExitKey parses the UdpReconnectExitKey ex-option.
+// It accepts "none", "ctrl+<letter>", and "^<letter>"; invalid values fall back to defaultUdpReconnectExitKey.
+func parseUdpReconnectExitKey(value string) byte {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return defaultUdpReconnectExitKey
+	}
+	lower := strings.ToLower(v)
+	if lower == "none" {
+		return 0
+	}
+
+	if strings.HasPrefix(lower, "ctrl+") && len(lower) == len("ctrl+")+1 {
+		return parseUdpReconnectControlKey(value, lower[len("ctrl+")])
+	}
+	if len(v) == 2 && v[0] == '^' {
+		return parseUdpReconnectControlKey(value, v[1])
+	}
+
+	warning("UdpReconnectExitKey: invalid value %q, fallback to %s", value, udpReconnectExitKeyName(defaultUdpReconnectExitKey))
+	return defaultUdpReconnectExitKey
 }
 
-func (c *outputCache) appendOutput(data []byte) {
-	for len(data) > 0 {
-		var last []byte
-		if len(c.chunks) > 0 {
-			last = c.chunks[len(c.chunks)-1]
-		}
-		if len(last) == cap(last) {
-			last = make([]byte, 0, max(len(data), 64*1024))
-			c.chunks = append(c.chunks, last)
-		}
-
-		n := min(len(data), cap(last)-len(last))
-		c.chunks[len(c.chunks)-1] = append(last, data[:n]...)
-		data = data[n:]
+func parseUdpReconnectControlKey(value string, b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		b += 'a' - 'A'
 	}
+	if b < 'a' || b > 'z' {
+		warning("UdpReconnectExitKey: %s is not a valid control key, fallback to %s", value, udpReconnectExitKeyName(defaultUdpReconnectExitKey))
+		return defaultUdpReconnectExitKey
+	}
+	key := byte(b-'a') + 1
+	if key == '\x01' {
+		warning("UdpReconnectExitKey: Ctrl+A is reserved, fallback to %s", udpReconnectExitKeyName(defaultUdpReconnectExitKey))
+		return defaultUdpReconnectExitKey
+	}
+	return key
 }
 
-func (c *outputCache) flushOutput(writer io.Writer) error {
-	if c.chunks == nil {
-		return nil
+func udpReconnectExitKeyName(key byte) string {
+	if key >= 0x01 && key <= 0x1a {
+		return fmt.Sprintf("Ctrl+%c", 'A'+key-1)
 	}
-
-	if enableDebugLogging {
-		cacheSize, filteredCount := 0, 0
-		for _, chunk := range c.chunks {
-			cacheSize += len(chunk)
-			filteredCount += bytes.Count(chunk, []byte("\x1b[6n"))
-		}
-		if cacheSize > 0 {
-			c.client.debug("session output cache size [%d]", cacheSize)
-		}
-		if filteredCount > 0 {
-			c.client.debug("filtered %d ESC[6n sequence(s) from cache output", filteredCount)
-		}
-	}
-
-	for _, chunk := range c.chunks {
-		chunk = bytes.ReplaceAll(chunk, []byte("\x1b[6n"), []byte(""))
-		if len(chunk) > 0 {
-			if _, err := writer.Write(chunk); err != nil {
-				return err
-			}
-		}
-	}
-	c.chunks = nil
-	return nil
+	return string(key)
 }
 
 func setupUdpNotification(sshConn *sshConnection) {
@@ -532,8 +502,9 @@ func setupUdpNotification(sshConn *sshConnection) {
 	}
 
 	ni := notifInterceptor{client: lastJumpUdpClient, interceptChan: make(chan byte, 1)}
-	ni.noticeOnTop = strings.ToLower(getExOptionConfig(sshConn.param.args, "ShowNotificationOnTop")) != "no"
-	ni.showFullNotif.Store(strings.ToLower(getExOptionConfig(sshConn.param.args, "ShowFullNotifications")) != "no")
+	ni.noticeOnTop = !strings.EqualFold(getExOptionConfig(sshConn.param.args, "ShowNotificationOnTop"), "no")
+	ni.showFullNotif.Store(!strings.EqualFold(getExOptionConfig(sshConn.param.args, "ShowFullNotifications"), "no"))
+	ni.exitKey = parseUdpReconnectExitKey(getExOptionConfig(sshConn.param.args, "UdpReconnectExitKey"))
 
 	inReader, inWriter := io.Pipe()
 	outReader, outWriter := io.Pipe()

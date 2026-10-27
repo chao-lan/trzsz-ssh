@@ -373,6 +373,9 @@ func (m *passwordModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.passwordInput += msg.Key().Text
 			m.err = nil
 		}
+	case tea.PasteMsg:
+		m.passwordInput += msg.String()
+		m.err = nil
 	case error:
 		m.err = msg
 		return m, nil
@@ -532,7 +535,7 @@ func execLocalTools(args *sshArgs) (int, bool) {
 	case args.RemoveHost != "":
 		return execRemoveHost(args)
 	case args.ListHosts:
-		return execListHosts()
+		return execListHosts(args)
 	case args.NewHost || args.Destination == "" && isFileNotExistOrEmpty(userConfig.configPath):
 		return execNewHost(args)
 	default:

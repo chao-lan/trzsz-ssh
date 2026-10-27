@@ -26,10 +26,19 @@ package tssh
 
 import (
 	"bytes"
+	"context"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
 
+	"github.com/trzsz/iterm2"
 	"golang.org/x/sys/unix"
 )
+
+const kDefaultSshSkHelperPath = "/usr/libexec/ssh-sk-helper"
 
 func isRemoteSshEnv(pid int) bool {
 	for range 1000 {
@@ -64,4 +73,87 @@ func isNoGUI() bool {
 		return false
 	}
 	return isDockerEnv() || isRemoteSshEnv(os.Getppid()) || isSshTmuxEnv()
+}
+
+var initIterm2Once sync.Once
+var iterm2Session *iterm2.Session
+
+func getIterm2Session() *iterm2.Session {
+	initIterm2Once.Do(func() {
+		if os.Getenv("TMUX") != "" {
+			if enableDebugLogging {
+				go debug("running in tmux")
+			}
+			return
+		}
+
+		if os.Getenv("ITERM_SESSION_ID") == "" {
+			return
+		}
+		if enableDebugLogging {
+			go debug("running in iTerm2")
+		}
+
+		app, err := iterm2.NewApp("tssh")
+		if err != nil {
+			if enableDebugLogging {
+				go debug("new iTerm2 app failed: %v", err)
+			}
+			return
+		}
+		addOnExitFunc(func() { _ = app.Close() })
+
+		iterm2Session, err = app.GetCurrentHostSession()
+		if err != nil {
+			if enableDebugLogging {
+				go debug("get iTerm2 host session failed: %v", err)
+			}
+			return
+		}
+	})
+	return iterm2Session
+}
+
+var initSshEnvOnce sync.Once
+var runningInSshEnv bool
+var sysCapRegex = regexp.MustCompile(`"System Capabilities"\s*=\s*(\d+)`)
+
+const kSystemCapabilityGraphics = (1 << 1)
+
+func shouldPauseReconnect() (bool, string) {
+	initSshEnvOnce.Do(func() {
+		runningInSshEnv = isDockerEnv() || isRemoteSshEnv(os.Getppid())
+	})
+	if runningInSshEnv || isSshTmuxEnv() {
+		return false, ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ioreg", "-r", "-k", "System Capabilities", "-d", "1")
+	output, err := cmd.Output()
+	if err != nil {
+		debug("execute ioreg command failed: %v", err)
+		return false, ""
+	}
+
+	matches := sysCapRegex.FindSubmatch(output)
+	if len(matches) < 2 {
+		debug("no 'System Capabilities' key in output: %s", string(output))
+		return false, ""
+	}
+
+	capStr := string(matches[1])
+	capabilities, err := strconv.ParseUint(capStr, 10, 64)
+	if err != nil {
+		debug("parse System Capabilities %q failed: %v", capStr, err)
+		return false, ""
+	}
+
+	if capabilities&kSystemCapabilityGraphics == 0 {
+		return true, "macOS Graphics capability is unavailable (possibly Dark Wake)"
+	}
+
+	return false, ""
 }

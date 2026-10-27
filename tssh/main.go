@@ -25,7 +25,9 @@ SOFTWARE.
 package tssh
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -36,6 +38,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/trzsz/go-arg"
+	"github.com/trzsz/tsshd/tsshd"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -55,27 +58,16 @@ func background(args *sshArgs, dest string) (bool, error) {
 		env = append(env, "TRZSZ-SSH-BACKGROUND=TRUE")
 	}
 
-	newArgs := os.Args
-	if args.Destination == "" {
-		newArgs = append(newArgs, dest)
-	} else if args.Destination != dest {
-		idx := -1
-		count := 0
-		for i, arg := range newArgs {
-			if arg == args.Destination {
-				idx = i
-				count++
-			}
-		}
-		if count != 1 {
-			return true, fmt.Errorf("don't know how to replace the destination: %s => %s", args.Destination, dest)
-		}
-		newArgs[idx] = dest
+	newArgs, err := replaceOrAppendDest(os.Args, args.Destination, dest)
+	if err != nil {
+		return true, err
 	}
+	exePath := getExePath(newArgs[0])
 
 	sleepTime := time.Duration(0)
 	for {
-		cmd := exec.Command(newArgs[0], newArgs[1:]...)
+		cmd := exec.Command(exePath, newArgs[1:]...)
+		cmd.Args = newArgs
 		cmd.Env = env
 		cmd.Stderr = os.Stderr
 
@@ -95,6 +87,121 @@ func background(args *sshArgs, dest string) (bool, error) {
 			time.Sleep(sleepTime)
 		} else {
 			sleepTime = 0
+		}
+	}
+}
+
+func getExePath(defaultPath string) string {
+	if path, err := os.Executable(); err == nil {
+		return path
+	}
+	return defaultPath
+}
+
+// replaceOrAppendDest returns a new args slice where the destination is replaced or appended.
+// Returns an error if it cannot safely replace the existing destination.
+func replaceOrAppendDest(args []string, oldDest, newDest string) ([]string, error) {
+	newArgs := make([]string, len(args))
+	copy(newArgs, args)
+
+	if oldDest == "" {
+		// No existing destination, append the new one
+		if newDest != "" {
+			newArgs = append(newArgs, newDest)
+		}
+	} else if oldDest != newDest {
+		// Replace old destination
+		idx := -1
+		count := 0
+		for i, arg := range newArgs {
+			if arg == oldDest {
+				idx = i
+				count++
+			}
+		}
+		if count != 1 {
+			return nil, fmt.Errorf("don't know how to replace the destination: %s => %s", oldDest, newDest)
+		}
+		newArgs[idx] = newDest
+	}
+
+	return newArgs, nil
+}
+
+func runWithReconnect(args *sshArgs, dest string) (err error) {
+	var newArgs []string
+	for _, arg := range os.Args {
+		if arg == "--reconnect" {
+			continue // skip --reconnect in child process
+		}
+		newArgs = append(newArgs, arg)
+	}
+
+	newArgs, err = replaceOrAppendDest(newArgs, args.Destination, dest)
+	if err != nil {
+		return err
+	}
+	exePath := getExePath(newArgs[0])
+
+	for {
+		cmd := exec.Command(exePath, newArgs[1:]...)
+		cmd.Args = newArgs
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("start child process failed: %v", err)
+		}
+
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt)
+		go func() {
+			for sig := range sigChan {
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(sig)
+				}
+			}
+		}()
+
+		_ = cmd.Wait()
+		signal.Stop(sigChan)
+		close(sigChan)
+
+		if !waitForEnter(cmd.ProcessState.ExitCode()) {
+			return nil
+		}
+	}
+}
+
+func waitForEnter(code int) bool {
+	color := "\033[32m"
+	if code != 0 {
+		color = "\033[31m"
+	}
+
+	fmt.Printf("%s[tssh child process exited with code %d]\033[0m\r\n"+
+		"Press Enter to restart and log in again, or Ctrl+C to exit.\r\n",
+		color, code)
+
+	state, err := makeStdinRaw()
+	if err != nil {
+		_, _ = fmt.Scanln()
+		return true
+	}
+	defer resetStdin(state)
+
+	var buf [1]byte
+	for {
+		n, err := os.Stdin.Read(buf[:])
+		if err != nil || n == 0 {
+			return false
+		}
+		switch buf[0] {
+		case '\r', '\n':
+			return true
+		case '\x03':
+			return false
 		}
 	}
 }
@@ -135,7 +242,11 @@ func addOnCloseFunc(f func()) {
 	onCloseFuncs = append(onCloseFuncs, f)
 }
 
-var isTerminal bool = isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+func isTerminalFd(fd uintptr) bool {
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
+
+var isTerminal bool = isTerminalFd(os.Stdin.Fd())
 
 // TrzMain is the main function of tssh program.
 func TsshMain(argv []string) int {
@@ -170,9 +281,6 @@ func TsshMain(argv []string) int {
 		debug("tssh version: %s", getTsshVersion())
 	}
 
-	// init iterm2 session if necessary
-	initIterm2Session()
-
 	// cleanup on exit
 	defer cleanupOnExit()
 
@@ -203,21 +311,22 @@ func TsshMain(argv []string) int {
 	// choose ssh alias
 	dest := ""
 	quit := false
-	if args.Destination == "" || args.Destination == "FAKE_DEST_IN_WARP" {
-		if !isTerminal {
-			fmt.Fprintln(os.Stderr, "destination is required when running tssh in non-interactive mode")
-			return kExitCodeNoDestHost
-		}
-		dest, quit, err = chooseAlias("", &args)
-		args.NoSave = false
-	} else {
-		dest, quit, err = predictDestination(args.Destination, &args)
-	}
+	dest, quit, err = chooseOrPredictDest(&args)
 	if quit {
 		err = nil
-		return 0
+		return kExitCodeCanceled
 	}
-	if err != nil {
+
+	// multiplexing control command
+	if args.ControlCmd != "" {
+		return execControlCmd(&args, dest)
+	}
+
+	// check dest before startup
+	if err != nil || dest == "" {
+		if err == nil {
+			err = fmt.Errorf("missing destination host")
+		}
 		return kExitCodeNoDestHost
 	}
 
@@ -232,14 +341,25 @@ func TsshMain(argv []string) int {
 			return 0
 		}
 	}
-	args.Destination = dest
-	args.originalDest = dest
 
-	if args.Dns != "" {
-		setDNS(args.Dns)
+	// prompt user to restart the program after exit
+	if args.Reconnect && isTerminal {
+		err = runWithReconnect(&args, dest)
+		if err != nil {
+			return kExitCodeReconnect
+		}
+		return 0
+	}
+
+	// custom DNS server
+	if args.DNS != "" {
+		setDNS(args.DNS)
+	} else if userConfig.customDnsServer != "" {
+		setDNS(userConfig.customDnsServer)
 	}
 
 	// start ssh program
+	args.Destination = dest
 	var code int
 	code, err = sshStart(&args)
 	return code
@@ -252,6 +372,9 @@ func sshStart(args *sshArgs) (int, error) {
 		return kExitCodeLoginFailed, err
 	}
 	defer func() {
+		// keep the control master alive while multiplexed clients are still connected
+		waitMuxMasterClients(sshConn)
+
 		cleanupOnClose()
 		sshConn.Close()
 	}()
@@ -289,7 +412,7 @@ func sshStart(args *sshArgs) (int, error) {
 	}
 
 	// ssh port forwarding
-	if !sshConn.param.control {
+	if !sshConn.param.controlClient {
 		sshPortForward(sshConn)
 	}
 
@@ -305,7 +428,7 @@ func sshStart(args *sshArgs) (int, error) {
 	}
 
 	// ssh agent forward
-	if !sshConn.param.control {
+	if !sshConn.param.controlClient {
 		sshAgentForward(sshConn)
 	}
 
@@ -313,11 +436,8 @@ func sshStart(args *sshArgs) (int, error) {
 	sshX11Forward(sshConn)
 
 	// set terminal title
-	if userConfig.setTerminalTitle != "" {
-		switch strings.ToLower(userConfig.setTerminalTitle) {
-		case "yes", "true":
-			setTerminalTitle(args.Destination)
-		}
+	if strings.EqualFold(userConfig.setTerminalTitle, "yes") || strings.EqualFold(userConfig.setTerminalTitle, "true") {
+		setTerminalTitle(args.Destination)
 	}
 
 	// execute remote tools if necessary
@@ -331,13 +451,28 @@ func sshStart(args *sshArgs) (int, error) {
 	}
 
 	// run command or start shell
-	if sshConn.cmd != "" {
+	if sess, ok := sshConn.session.(*tsshd.SshUdpSession); ok && udpAttachSessionID > 0 {
+		if err := sess.Attach(udpAttachSessionID); err != nil {
+			wantExit.Store(true)
+			if sshConn.tty {
+				var te *tsshd.Error
+				if errors.As(err, &te) && te.Code == tsshd.ErrNotPty {
+					wantExit.Store(false)
+				}
+			}
+			return kExitCodeAttachFail, fmt.Errorf("attach session [%d] failed: %v", udpAttachSessionID, err)
+		}
+	} else if sshConn.cmd != "" {
 		if err := sshConn.session.Start(sshConn.cmd); err != nil {
 			return kExitCodeStartFailed, fmt.Errorf("start command [%s] failed: %v", sshConn.cmd, err)
 		}
 	} else {
 		if err := sshConn.session.Shell(); err != nil {
-			return kExitCodeShellFailed, fmt.Errorf("start shell failed: %v", err)
+			if !errors.Is(err, io.EOF) {
+				return kExitCodeShellFailed, fmt.Errorf("start shell failed: %v", err)
+			}
+			debug("shell request reached EOF before reply, continuing")
+			sshConn.startEOF = true
 		}
 	}
 
@@ -378,7 +513,7 @@ func sshStart(args *sshArgs) (int, error) {
 }
 
 func execLocalCommand(param *sshParam) {
-	if strings.ToLower(getOptionConfig(param.args, "PermitLocalCommand")) != "yes" {
+	if !strings.EqualFold(getOptionConfig(param.args, "PermitLocalCommand"), "yes") {
 		return
 	}
 	localCmd := getOptionConfig(param.args, "LocalCommand")
@@ -434,7 +569,7 @@ func openSession(sshConn *sshConnection) (err error) {
 	}
 
 	// send and set env
-	term, err := sendAndSetEnv(sshConn)
+	term, err := sendAndSetEnv(sshConn.param.args, sshConn.session)
 	if err != nil {
 		return err
 	}
@@ -448,12 +583,6 @@ func openSession(sshConn *sshConnection) (err error) {
 	width, height, err := getTerminalSize()
 	if err != nil {
 		return fmt.Errorf("get terminal size for [%s] failed: %v", sshConn.param.args.Destination, err)
-	}
-	if term == "" {
-		term = os.Getenv("TERM")
-		if term == "" {
-			term = "xterm-256color"
-		}
 	}
 	if err := sshConn.session.RequestPty(term, height, width, ssh.TerminalModes{}); err != nil {
 		return fmt.Errorf("request pty for [%s] failed: %v", sshConn.param.args.Destination, err)
@@ -478,7 +607,7 @@ func handleExitSignals(sshConn *sshConnection) {
 			if isRunningOnOldWindows.Load() && sig.String() == "interrupt" {
 				continue
 			}
-			sshConn.forceExit(kExitCodeSignalKill, fmt.Sprintf("Exit due to signal [%v] from the operating system", sig))
+			sshConn.forceExit(kExitCodeSignalKill, fmt.Sprintf("signal [%v] from the operating system", sig))
 			break
 		}
 	}()

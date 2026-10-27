@@ -47,6 +47,9 @@ func writeAll(dst io.Writer, data []byte) error {
 		if err != nil {
 			return err
 		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 		m += n
 	}
 	return nil
@@ -57,6 +60,10 @@ func forwardInput(reader io.Reader, writer io.WriteCloser, win bool, escapeChar 
 		_ = writer.Close()
 		debug("ssh session stdin forward completed")
 	}()
+
+	if sshConn.param.args.NoStdin {
+		return
+	}
 
 	var enterPressedFlag bool
 	var enterPressedTime time.Time
@@ -156,7 +163,8 @@ func wrapStdIO(serverIn io.WriteCloser, serverOut, serverErr io.Reader, escapeCh
 			if enableDebugLogging {
 				debug("ssh session stderr forward completed")
 				if tmuxDebugPaneID == "" && time.Since(beginTime) < 3*time.Second {
-					sshConn.session.RedrawScreen()
+					// debug log output may obscure the prompt, attempt to force a screen refresh
+					_ = sshConn.session.RedrawScreen(true)
 				}
 			}
 		})
@@ -176,7 +184,7 @@ func getEscapeConfig(args *sshArgs) (byte, time.Duration) {
 
 	escapeChar := byte('~')
 	if escCh := getOptionConfig(args, "EscapeChar"); escCh != "" {
-		if strings.ToLower(escCh) == "none" {
+		if strings.EqualFold(escCh, "none") {
 			consoleEscapeTime = 0
 		} else if len(escCh) == 2 && escCh[0] == '^' {
 			b := escCh[1]
@@ -195,7 +203,7 @@ func getEscapeConfig(args *sshArgs) (byte, time.Duration) {
 		} else if len(escCh) == 1 {
 			b := escCh[0]
 			switch b {
-			case 'j', 'k', 'q', '.', 'B', 'C', 'R', 'V', 'v', '#', '&', '?':
+			case 'j', 'k', 'q', '.', 'B', 'C', 'R', 'V', 'v', '#', '&', '?', 'd':
 				warning("EscapeChar [%s] conflicts with other shortcuts", escCh)
 			default:
 				if b <= ' ' || b > '~' {

@@ -99,7 +99,9 @@ func (s *expectSender) newSendText(showText, sendText string) *expectSendText {
 	}
 
 	if expanded, err := expandTokens(sendText, s.expect.param, "%hprnLlj"); err != nil {
-		warning("expand send text %s failed: %v", strconv.QuoteToASCII(sendText), strconv.QuoteToASCII(err.Error()))
+		if enableWarningLogging {
+			warning("expand send text %s failed: %v", strconv.QuoteToASCII(sendText), strconv.QuoteToASCII(err.Error()))
+		}
 		est.sendText = sendText
 	} else {
 		est.sendText = expanded
@@ -229,22 +231,6 @@ func (s *expectSender) sendInput(writer io.Writer, id string) bool {
 	return true
 }
 
-func quoteExpectPattern(pattern string) string {
-	var buf strings.Builder
-	for _, c := range pattern {
-		switch c {
-		case '*':
-			buf.WriteString(".*")
-		case '?', '(', ')', '[', ']', '{', '}', '.', '+', ',', '-', '^', '$', '|', '\\':
-			buf.WriteRune('\\')
-			buf.WriteRune(c)
-		default:
-			buf.WriteRune(c)
-		}
-	}
-	return buf.String()
-}
-
 func (c *caseSendList) splitConfig(config string) (string, string, error) {
 	index := strings.IndexFunc(config, unicode.IsSpace)
 	if index <= 0 {
@@ -271,7 +257,7 @@ func (c *caseSendList) addCaseSendPass(config string) error {
 	if err != nil {
 		return err
 	}
-	expr := quoteExpectPattern(pattern)
+	expr := wildcardToRegexp(pattern)
 	re, err := regexp.Compile(expr)
 	if err != nil {
 		return fmt.Errorf("compile expect expr [%s] failed: %v", expr, err)
@@ -289,7 +275,7 @@ func (c *caseSendList) addCaseSendText(config string) error {
 	if err != nil {
 		return err
 	}
-	expr := quoteExpectPattern(pattern)
+	expr := wildcardToRegexp(pattern)
 	re, err := regexp.Compile(expr)
 	if err != nil {
 		return fmt.Errorf("compile expect expr [%s] failed: %v", expr, err)
@@ -322,7 +308,9 @@ func (e *sshExpect) captureOutput(reader io.Reader, ch chan<- []byte) ([]byte, e
 			case <-e.ctx.Done():
 				return buf, nil
 			case ch <- buf:
-				debug("expect capture output: %s", strconv.QuoteToASCII(string(buf)))
+				if enableDebugLogging {
+					debug("expect capture output: %s", strconv.QuoteToASCII(string(buf)))
+				}
 			}
 		}
 		if err == io.EOF {
@@ -383,7 +371,7 @@ func drainOrClosed[T any](ch <-chan T) {
 }
 
 func (e *sshExpect) waitForPattern(pattern string, caseSends *caseSendList) (string, error) {
-	expr := quoteExpectPattern(pattern)
+	expr := wildcardToRegexp(pattern)
 	re, err := regexp.Compile(expr)
 	if err != nil {
 		warning("compile expect expr [%s] failed: %v", expr, err)
@@ -468,12 +456,12 @@ func (e *sshExpect) execInteractions(writer io.Writer, expectCount int) {
 			warning("expect %d pattern is empty, no output will be matched", idx)
 		}
 		caseSends := &caseSendList{e, writer, nil}
-		for _, cfg := range getAllExOptionConfig(e.param.args, fmt.Sprintf("%sExpectCaseSendPass%d", e.pre, idx)) {
+		for _, cfg := range getAllExOptionConfig(e.param.args, fmt.Sprintf("%sExpectCaseSendPass%d", e.pre, idx), true) {
 			if err := caseSends.addCaseSendPass(cfg); err != nil {
 				warning("Invalid ExpectCaseSendPass%d: %v", idx, err)
 			}
 		}
-		for _, cfg := range getAllExOptionConfig(e.param.args, fmt.Sprintf("%sExpectCaseSendText%d", e.pre, idx)) {
+		for _, cfg := range getAllExOptionConfig(e.param.args, fmt.Sprintf("%sExpectCaseSendText%d", e.pre, idx), true) {
 			if err := caseSends.addCaseSendText(cfg); err != nil {
 				warning("Invalid ExpectCaseSendText%d: %v", idx, err)
 			}
@@ -550,7 +538,8 @@ func execExpectInteractions(sshConn *sshConnection) {
 
 	if ctx.Err() == context.DeadlineExceeded {
 		warning("expect timeout after %d seconds", expectTimeout)
-		sshConn.session.RedrawScreen()
+		// The prompt may be obscured after timeout, trigger a screen refresh.
+		_ = sshConn.session.RedrawScreen(true)
 	}
 
 	sshConn.serverOut = outReader

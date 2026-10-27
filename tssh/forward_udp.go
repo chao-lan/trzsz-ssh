@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/trzsz/tsshd/tsshd"
 )
 
 const kWarnIntervalSeconds = 60
@@ -96,7 +98,7 @@ func (f *udpLocalForwarder) run() {
 	for {
 		n, addr, err := f.localConn.ReadFrom(buf)
 		if err != nil {
-			if isClosedError(err) {
+			if tsshd.IsClosedError(err) {
 				debug("udp local forwarding [%v] local closed: %v", f.fwdConfig, err)
 				break
 			}
@@ -158,7 +160,7 @@ func (f *udpLocalForwarder) handlePacket(clientAddr net.Addr, data []byte) {
 				}
 				return nil
 			}); err != nil {
-				if isClosedError(err) {
+				if tsshd.IsClosedError(err) {
 					debug("udp local forwarding [%v] consume closed: %v", f.fwdConfig, err)
 					return
 				}
@@ -229,7 +231,7 @@ func (f *udpRemoteForwarder) run() {
 		_ = f.remoteConn.Consume(func(buf []byte) error {
 			f.lastActive.Store(time.Now().Unix())
 			if _, err := f.localConn.Write(buf); err != nil {
-				if isClosedError(err) {
+				if tsshd.IsClosedError(err) {
 					debug("udp remote forwarding [%s] write to local closed: %v", f.fwdConfig, err)
 					return err
 				}
@@ -247,7 +249,7 @@ func (f *udpRemoteForwarder) run() {
 		for {
 			n, err := f.localConn.Read(buffer)
 			if err != nil {
-				if isClosedError(err) {
+				if tsshd.IsClosedError(err) {
 					debug("udp remote forwarding [%s] read from local closed: %v", f.fwdConfig, err)
 					return
 				}
@@ -256,7 +258,7 @@ func (f *udpRemoteForwarder) run() {
 			}
 			f.lastActive.Store(time.Now().Unix())
 			if err := f.remoteConn.Write(buffer[:n]); err != nil {
-				if isClosedError(err) {
+				if tsshd.IsClosedError(err) {
 					debug("udp remote forwarding [%s] write to remote closed: %v", f.fwdConfig, err)
 					return
 				}
@@ -355,23 +357,45 @@ func cloneNetAddr(addr net.Addr) net.Addr {
 	}
 }
 
-func listenOnLocalUDP(gateway bool, addr *string, port, name string) (conns []net.PacketConn) {
+type cleanupPacketConn struct {
+	net.PacketConn
+	cleanup func() (bool, error)
+}
+
+func (c *cleanupPacketConn) Close() error {
+	_, err := c.cleanup()
+	return err
+}
+
+func listenOnLocalUDP(gateway bool, addr *string, port, name string, unlinkUnix bool, bindMask int) (conns []net.PacketConn) {
 	listen := func(network, address string) {
+		if unlinkUnix && network == "unixgram" {
+			if err := unlinkStaleUnixSocket(address); err != nil {
+				warning("%s unlink [%s] failed: %v", name, address, err)
+				return
+			}
+		}
+
 		conn, err := net.ListenPacket(network, address)
 		if err != nil {
 			warning("%s listen on local [%s] [%s] failed: %v", name, network, address, err)
-		} else {
-			debug("%s listen on local [%s] [%s] success", name, network, address)
-			conns = append(conns, conn)
-			addOnCloseFunc(func() {
-				_ = conn.Close()
-				if network == "unixgram" {
-					if err := os.Remove(address); err != nil {
-						debug("remove unix socket [%s] failed: %v", address, err)
-					}
-				}
-			})
+			return
 		}
+
+		if network == "unixgram" {
+			mode := os.FileMode(0666) &^ os.FileMode(bindMask)
+			if err := os.Chmod(address, mode); err != nil {
+				warning("%s chmod unix socket [%s] to %#o failed: %v", name, address, mode, err)
+				_ = conn.Close()
+				_ = os.Remove(address)
+				return
+			}
+			conn = &cleanupPacketConn{conn, newFileUnlinker(address, conn)}
+		}
+
+		debug("%s listen on local [%s] [%s] success", name, network, address)
+		conns = append(conns, conn)
+		addOnCloseFunc(func() { _ = conn.Close() })
 	}
 
 	if addr == nil && gateway || addr != nil && (*addr == "" || *addr == "*") {
@@ -395,7 +419,7 @@ func listenOnLocalUDP(gateway bool, addr *string, port, name string) (conns []ne
 	return
 }
 
-func localForwardUDP(sshConn *sshConnection, f *forwardCfg, gateway bool, timeout time.Duration) {
+func localForwardUDP(sshConn *sshConnection, f *forwardCfg, gateway bool, timeout time.Duration, unlinkUnix bool, bindMask int) {
 	var remoteNet, remoteAddr string
 	if f.destPort == -1 && strings.HasPrefix(f.destHost, "/") {
 		remoteNet = "unixgram"
@@ -406,7 +430,7 @@ func localForwardUDP(sshConn *sshConnection, f *forwardCfg, gateway bool, timeou
 	}
 
 	name := fmt.Sprintf("local forwarding [%v]", f)
-	for _, conn := range listenOnLocalUDP(gateway, f.bindAddr, strconv.Itoa(f.bindPort), name) {
+	for _, conn := range listenOnLocalUDP(gateway, f.bindAddr, strconv.Itoa(f.bindPort), name, unlinkUnix, bindMask) {
 		forwarder := &udpLocalForwarder{
 			client:      sshConn.client,
 			timeout:     timeout,
@@ -480,7 +504,7 @@ func remoteForwardUDP(sshConn *sshConnection, f *forwardCfg, gateway bool, timeo
 			for {
 				remoteConn, err := listener.AcceptUDP()
 				if err != nil {
-					if isClosedError(err) {
+					if tsshd.IsClosedError(err) {
 						debug("remote forwarding [%v] closed: %v", f, err)
 						break
 					}
@@ -508,12 +532,11 @@ func remoteForwardUDP(sshConn *sshConnection, f *forwardCfg, gateway bool, timeo
 
 type unixgramConn struct {
 	io.ReadWriteCloser
-	localAddr string
+	cleanup func() (bool, error)
 }
 
 func (c *unixgramConn) Close() error {
-	err := c.ReadWriteCloser.Close()
-	_ = os.Remove(c.localAddr)
+	_, err := c.cleanup()
 	return err
 }
 
@@ -539,7 +562,7 @@ func dialUDP(network, address string, timeout time.Duration) (io.ReadWriteCloser
 			}
 			return nil, err
 		}
-		return &unixgramConn{conn, localAddr}, nil
+		return &unixgramConn{conn, newFileUnlinker(localAddr, conn)}, nil
 	}
 
 	var err error

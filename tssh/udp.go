@@ -27,6 +27,7 @@ package tssh
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,7 +43,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const kDefaultUdpAliveTimeout = 24 * time.Hour
+const kDefaultUdpAliveTimeout = 10 * 24 * time.Hour
 
 const kDefaultUdpHeartbeatTimeout = 3 * time.Second
 
@@ -78,6 +79,7 @@ type sshUdpClient struct {
 	notifInterceptor *notifInterceptor
 	notifModel       atomic.Pointer[notifModel]
 	sshDestName      string
+	attachMode       bool
 	sshConn          atomic.Pointer[sshConnection]
 }
 
@@ -89,15 +91,20 @@ func (c *sshUdpClient) DialTimeout(network, addr string, timeout time.Duration) 
 	return c.SshUdpClient.DialTimeout(network, addr, timeout)
 }
 
-func (c *sshUdpClient) Close() error {
-	err := c.SshUdpClient.Close()
+func (c *sshUdpClient) Close() (err error) {
+	if c.attachMode && !wantExit.Load() {
+		c.Detach()
+	} else {
+		err = c.SshUdpClient.Close()
+	}
+
 	if c.waitCloseChan != nil {
 		select {
 		case c.waitCloseChan <- struct{}{}:
 		default:
 		}
 	}
-	return err
+	return
 }
 
 func (c *sshUdpClient) Wait() error {
@@ -105,14 +112,6 @@ func (c *sshUdpClient) Wait() error {
 		<-c.waitCloseChan
 	}
 	return c.SshUdpClient.Wait()
-}
-
-func (c *sshUdpClient) exit(code int, cause string) {
-	if notif := c.notifModel.Load(); notif != nil {
-		notif.clientExiting.Store(true)
-		notif.renderView(true, false)
-	}
-	c.sshConn.Load().forceExit(code, cause)
 }
 
 func (c *sshUdpClient) debug(format string, a ...any) {
@@ -131,7 +130,8 @@ func (c *sshUdpClient) udpKeepAlive() {
 	for !c.IsClosed() {
 		if c.sshConn.Load() != nil && time.Since(time.UnixMilli(c.GetLastActiveTime())) > c.aliveTimeout {
 			c.debug("alive timeout for %v", c.aliveTimeout)
-			c.exit(kExitCodeUdpTimeout, fmt.Sprintf("Exit due to connection was lost and timeout for %v", c.aliveTimeout))
+			c.sshConn.Load().forceExit(kExitCodeUdpTimeout,
+				fmt.Sprintf("lost connection and timeout after %s", formatSshTime(uint32(c.aliveTimeout/time.Second))))
 			return
 		}
 
@@ -144,8 +144,9 @@ func (c *sshUdpClient) udpKeepAlive() {
 }
 
 func (c *sshUdpClient) getConnLostStatus() string {
-	return fmt.Sprintf("Oops, looks like the connection to the server was lost, trying to reconnect for %d/%d seconds.",
-		time.Since(time.UnixMilli(c.GetLastActiveTime()))/time.Second, c.aliveTimeout/time.Second)
+	return fmt.Sprintf("Oops, looks like the connection to the server was lost, trying to reconnect for %s/%s.",
+		formatSshTime(uint32(time.Since(time.UnixMilli(c.GetLastActiveTime()))/time.Second)),
+		formatSshTime(uint32(c.aliveTimeout/time.Second)))
 }
 
 func (c *sshUdpClient) notifyConnectionLost() {
@@ -173,28 +174,25 @@ func (c *sshUdpClient) notifyConnectionLost() {
 	showConnectionLostNotif(c)
 }
 
-func (c *sshUdpClient) discardPendingInput(discardMarker []byte) {
-	if c.notifInterceptor == nil {
-		return
-	}
-	if input := c.notifInterceptor.discardPendingInput(discardMarker); len(input) > 0 {
-		if enableDebugLogging {
-			c.debug("[client] discard input: %s", strconv.QuoteToASCII(string(input)))
-		}
-		if isRunningTmuxIntegration() {
-			handleTmuxDiscardedInput(input)
-		}
-	}
-}
-
 var lastJumpUdpClient *sshUdpClient
 var globalUdpAliveTimeout time.Duration
 
 func quitCallback(name, reason string) {
-	for lastJumpUdpClient == nil || lastJumpUdpClient.sshConn.Load() == nil {
-		time.Sleep(10 * time.Millisecond) // waiting for sshConn to be initialized
+	// Wait up to 10 seconds for lastJumpUdpClient and sshConn to be initialized
+	for range 1000 {
+		if lastJumpUdpClient != nil && lastJumpUdpClient.sshConn.Load() != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	lastJumpUdpClient.sshConn.Load().forceExit(kExitCodeSignalKill, fmt.Sprintf("Exit due to [%s] %s", name, reason))
+
+	if lastJumpUdpClient == nil || lastJumpUdpClient.sshConn.Load() == nil {
+		warning("quitCallback failed: lastJumpUdpClient [%v] or sshConn not initialized within timeout (name: %s, reason: %s)",
+			lastJumpUdpClient, name, reason)
+		return
+	}
+
+	lastJumpUdpClient.sshConn.Load().forceExit(kExitCodeSignalKill, fmt.Sprintf("[%s] %s", name, reason))
 }
 
 func initGlobalUdpAliveTimeout(args *sshArgs) {
@@ -228,6 +226,11 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 		}
 	}
 
+	var tcpMode bool
+	if strings.EqualFold(getExOptionConfig(args, "UdpProxyMode"), "tcp") {
+		tcpMode = true
+	}
+
 	var proxyClient *sshUdpClient
 	if param.proxy != nil {
 		var ok bool
@@ -238,16 +241,59 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 		if mtu == 0 {
 			mtu = proxyClient.GetMaxDatagramSize()
 		}
+	} else if param.command != "" {
+		tcpMode = true // proxy command implies tcp
 	}
 
 	// start tsshd
+	attachMode := false
+	tsshdPath := getTsshdPath(args)
 	connectTimeout := getConnectTimeout(args)
-	tsshdCmd := getTsshdCommand(param, mtu, connectTimeout)
+	sessionName := getExOptionConfig(args, "UdpSessionName")
+	var tsshdCmdBuf *strings.Builder
+	if args.Attach || strings.EqualFold(getExOptionConfig(args, "UdpSessionAttach"), "yes") {
+		attachMode = true
+		var err error
+		tsshdCmdBuf, err = attachToSession(tcpClient, tsshdPath, sessionName)
+		if err != nil {
+			if errors.Is(err, errAttachTsshdTooOld) {
+				attachMode = false
+			} else if errors.Is(err, errAttachSessionSelection) {
+				return nil, fmt.Errorf("failed to select tsshd session to attach: %v", err)
+			}
+			warning("falling back to new session due to attach failed: %v", err)
+		}
+		if tsshdCmdBuf == nil {
+			tsshdCmdBuf = getTsshdCommand(param, tsshdPath, mtu, tcpMode, connectTimeout)
+			if attachMode {
+				tsshdCmdBuf.WriteString(" --attachable --socket")
+			}
+		}
+	} else {
+		tsshdCmdBuf = getTsshdCommand(param, tsshdPath, mtu, tcpMode, connectTimeout)
+	}
+	tsshdCmd := tsshdCmdBuf.String()
 	debug("udp login to [%s] tsshd command: %s", args.Destination, tsshdCmd)
 
-	serverInfo, err := startTsshdServer(tcpClient, tsshdCmd)
+	serverInfo, err := startTsshdServer(args, tcpClient, tsshdCmd)
 	if err != nil {
 		return nil, fmt.Errorf("udp login to [%s] start tsshd on remote failed: %v", args.Destination, err)
+	}
+
+	// proxy command
+	var proxyCmd string
+	if proxyClient == nil && param.command != "" {
+		if !containsToken(param.command, 'p') {
+			return nil, fmt.Errorf("proxy command [%s] must use %%p to connect to the dynamically allocated tsshd port", param.command)
+		}
+		udpParam := *param
+		udpParam.port = strconv.Itoa(serverInfo.Port)
+		expandedCommand, err := expandTokens(param.command, &udpParam, "%hnpr")
+		if err != nil {
+			return nil, fmt.Errorf("expand proxy command [%s] failed: %v", param.command, err)
+		}
+		proxyCmd = resolveHomeDir(expandedCommand)
+		debug("udp proxy command: %s", proxyCmd)
 	}
 
 	// udp config
@@ -262,6 +308,12 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 	intervalTime := min(globalUdpAliveTimeout/10, min(heartbeatTimeout, reconnectTimeout)/3)
 	debug("udp keep alive interval time [%v] for [%s]", intervalTime, args.Destination)
 
+	ipv4, ipv6 := param.ipv4, param.ipv6
+	if ipv4 == ipv6 { // (ipv4 && ipv6) || (!ipv4 && !ipv6)
+		// If the IP version is ambiguous from the current SSH connection (e.g., via ControlPath), fall back to user settings.
+		_, ipv4, ipv6 = getNetworkAddressFamily(args)
+	}
+
 	// new udp client
 	udpClient := &sshUdpClient{
 		proxyClient:      proxyClient,
@@ -270,30 +322,27 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 		connectTimeout:   connectTimeout,
 		reconnectTimeout: reconnectTimeout,
 		sshDestName:      args.Destination,
+		attachMode:       attachMode,
 	}
 	tsshdAddr := joinHostPort(param.host, strconv.Itoa(serverInfo.Port))
 	clientOpts := &tsshd.UdpClientOptions{
-		EnableDebugging:  enableDebugLogging,
-		EnableWarning:    enableWarningLogging,
-		IPv4:             param.ipv4,
-		IPv6:             param.ipv6,
-		TsshdAddr:        tsshdAddr,
-		ServerInfo:       serverInfo,
-		AliveTimeout:     globalUdpAliveTimeout,
-		IntervalTime:     intervalTime,
-		ConnectTimeout:   connectTimeout,
-		HeartbeatTimeout: heartbeatTimeout,
-		DebugFunc:        func(msec int64, msg string) { writeDebugLog(msec, args.Destination, msg) },
-		WarningFunc:      func(msg string) { warning("udp [%s] %s", args.Destination, msg) },
-		QuitCallback:     func(reason string) { quitCallback(args.Destination, reason) },
-		DiscardCallback: func(discardMarker, discardedInput []byte) {
-			if len(discardMarker) > 0 {
-				udpClient.discardPendingInput(discardMarker)
-			}
-			if len(discardedInput) > 0 && isRunningTmuxIntegration() {
-				handleTmuxDiscardedInput(discardedInput)
-			}
-		},
+		EnableDebugging:      enableDebugLogging,
+		EnableWarning:        enableWarningLogging,
+		IPv4:                 ipv4,
+		IPv6:                 ipv6,
+		TsshdAddr:            tsshdAddr,
+		SessionName:          sessionName,
+		ServerInfo:           serverInfo,
+		AliveTimeout:         globalUdpAliveTimeout,
+		IntervalTime:         intervalTime,
+		ConnectTimeout:       connectTimeout,
+		HeartbeatTimeout:     heartbeatTimeout,
+		DebugFunc:            func(msec int64, msg string) { writeDebugLog(msec, args.Destination, msg) },
+		WarningFunc:          func(msg string) { warning("udp [%s] %s", args.Destination, msg) },
+		QuitCallback:         func(reason string) { quitCallback(args.Destination, reason) },
+		DiscardCallback:      handleTmuxDiscardedInput,
+		ProxyCommand:         proxyCmd,
+		ShouldPauseReconnect: shouldPauseReconnect,
 	}
 
 	if param.proxy != nil {
@@ -301,6 +350,17 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 		debug("udp login to [%s] via proxy jump [%s] addr: %s", args.Destination, param.proxy.name, tsshdAddr)
 	} else {
 		debug("udp login to [%s] tsshd server addr: %s", param.args.Destination, tsshdAddr)
+	}
+
+	if strings.EqualFold(userConfig.setTerminalTitle, "rtt") {
+		clientOpts.RttCallback = func(rtt int64) {
+			if lastJumpUdpClient == nil {
+				return
+			}
+			if sshConn := lastJumpUdpClient.sshConn.Load(); sshConn != nil && sshConn.client == udpClient {
+				setTerminalTitle(fmt.Sprintf("%s %dms", args.Destination, rtt))
+			}
+		}
 	}
 
 	udpClient.SshUdpClient, err = tsshd.NewSshUdpClient(clientOpts)
@@ -322,12 +382,22 @@ func udpLogin(param *sshParam, tcpClient SshClient) (SshClient, error) {
 	return udpClient, nil
 }
 
-func startTsshdServer(tcpClient SshClient, tsshdCmd string) (*tsshd.ServerInfo, error) {
+func startTsshdServer(args *sshArgs, tcpClient SshClient, tsshdCmd string) (*tsshd.ServerInfo, error) {
 	session, err := tcpClient.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("new session failed: %v", err)
 	}
 	defer func() { _ = session.Close() }()
+
+	// Some Windows SSH servers treat a missing stdin as EOF, which may
+	// cause the remote command to exit prematurely and prevent tsshd
+	// from starting. Attach a stdin pipe to avoid this.
+	serverIn, err := session.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe failed: %v", err)
+	}
+	defer func() { _ = serverIn.Close() }()
+
 	serverOut, err := session.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe failed: %v", err)
@@ -336,7 +406,13 @@ func startTsshdServer(tcpClient SshClient, tsshdCmd string) (*tsshd.ServerInfo, 
 	if err != nil {
 		return nil, fmt.Errorf("stderr pipe failed: %v", err)
 	}
-	if err := session.RequestPty("xterm-256color", 200, 800, ssh.TerminalModes{}); err != nil {
+
+	term, err := sendAndSetEnv(args, session)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := session.RequestPty(term, 200, 800, ssh.TerminalModes{}); err != nil {
 		return nil, fmt.Errorf("request pty for tsshd failed: %v", err)
 	}
 
@@ -346,17 +422,14 @@ func startTsshdServer(tcpClient SshClient, tsshdCmd string) (*tsshd.ServerInfo, 
 
 	if err := session.Wait(); err != nil {
 		var builder strings.Builder
+		fmt.Fprintf(&builder, "session wait failed: %v", err)
 		if outMsg, _ := readConsoleOutput(serverOut); outMsg != "" {
+			builder.WriteByte('\n')
 			builder.WriteString(outMsg)
 		}
 		if errMsg, _ := readConsoleOutput(serverErr); errMsg != "" {
-			if builder.Len() > 0 {
-				builder.WriteString("\n")
-			}
+			builder.WriteByte('\n')
 			builder.WriteString(errMsg)
-		}
-		if builder.Len() == 0 {
-			builder.WriteString(fmt.Sprintf("session wait failed: %v", err))
 		}
 		return nil, fmt.Errorf("%s\r\n%s", builder.String(),
 			"\033[0;36mHint:\033[0m Have you installed tsshd on your server? You may need to specify the path to tsshd.")
@@ -399,38 +472,42 @@ func startTsshdServer(tcpClient SshClient, tsshdCmd string) (*tsshd.ServerInfo, 
 	return &info, nil
 }
 
-func getTsshdCommand(param *sshParam, mtu uint16, connectTimeout time.Duration) string {
+func getTsshdPath(args *sshArgs) string {
+	if args.TsshdPath != "" {
+		return args.TsshdPath
+	}
+	if tsshdPath := getExOptionConfig(args, "TsshdPath"); tsshdPath != "" {
+		return tsshdPath
+	}
+	return "tsshd"
+}
+
+func getTsshdCommand(param *sshParam, tsshdPath string, mtu uint16, tcpMode bool, connectTimeout time.Duration) *strings.Builder {
 	args := param.args
 	var buf strings.Builder
-	if args.TsshdPath != "" {
-		buf.WriteString(args.TsshdPath)
-	} else if tsshdPath := getExOptionConfig(args, "TsshdPath"); tsshdPath != "" {
-		buf.WriteString(tsshdPath)
-	} else {
-		buf.WriteString("tsshd")
-	}
+	buf.WriteString(tsshdPath)
 
 	if param.udpMode == kUdpModeKcp {
 		buf.WriteString(" --kcp")
 	}
-	if udpProxyMode := strings.ToLower(getExOptionConfig(args, "UdpProxyMode")); udpProxyMode == "tcp" {
+	if tcpMode {
 		buf.WriteString(" --tcp")
 	}
 	if enableDebugLogging {
 		buf.WriteString(" --debug")
 	}
 
-	network := getNetworkAddressFamily(args)
-	if strings.HasSuffix(network, "4") {
+	_, ipv4, ipv6 := getNetworkAddressFamily(args)
+	if ipv4 {
 		buf.WriteString(" --ipv4")
 	}
-	if strings.HasSuffix(network, "6") {
+	if ipv6 {
 		buf.WriteString(" --ipv6")
 	}
 
 	if mtu > 0 {
 		buf.WriteString(" --mtu ")
-		buf.WriteString(fmt.Sprintf("%d", mtu))
+		fmt.Fprintf(&buf, "%d", mtu)
 	}
 
 	tsshdPort := args.TsshdPort
@@ -449,9 +526,9 @@ func getTsshdCommand(param *sshParam, mtu uint16, connectTimeout time.Duration) 
 					buf.WriteByte(',')
 				}
 				if r[0] == r[1] {
-					buf.WriteString(fmt.Sprintf("%d", r[0]))
+					fmt.Fprintf(&buf, "%d", r[0])
 				} else {
-					buf.WriteString(fmt.Sprintf("%d-%d", r[0], r[1]))
+					fmt.Fprintf(&buf, "%d-%d", r[0], r[1])
 				}
 			}
 		}
@@ -459,10 +536,10 @@ func getTsshdCommand(param *sshParam, mtu uint16, connectTimeout time.Duration) 
 
 	if connectTimeout != kDefaultConnectTimeout {
 		buf.WriteString(" --connect-timeout ")
-		buf.WriteString(fmt.Sprintf("%d", connectTimeout/time.Second))
+		fmt.Fprintf(&buf, "%d", connectTimeout/time.Second)
 	}
 
-	return buf.String()
+	return &buf
 }
 
 func parseTsshdPortRanges(tsshdPort string) [][2]uint16 {
@@ -557,10 +634,14 @@ func getUdpTimeoutConfig(args *sshArgs, timeoutOption string, defaultTimeout tim
 }
 
 func getUdpMode(args *sshArgs) udpModeType {
+	if args.TCP {
+		return kUdpModeNo
+	}
+
 	if udpMode := args.Option.get("UdpMode"); udpMode != "" {
 		switch strings.ToLower(udpMode) {
 		case "no":
-			if args.UDP || args.KCP {
+			if args.UDP || args.KCP || args.QUIC || args.Attach {
 				warning("disable UDP mode since -oUdpMode=No")
 			}
 			return kUdpModeNo
@@ -578,8 +659,11 @@ func getUdpMode(args *sshArgs) udpModeType {
 	if args.KCP {
 		return kUdpModeKcp
 	}
+	if args.QUIC {
+		return kUdpModeQuic
+	}
 
-	udpMode := getExConfig(args.Destination, "UdpMode")
+	udpMode := getExConfig(args, "UdpMode")
 	switch strings.ToLower(udpMode) {
 	case "", "no":
 		break
@@ -593,7 +677,7 @@ func getUdpMode(args *sshArgs) udpModeType {
 		warning("unknown UdpMode %s", udpMode)
 	}
 
-	if args.UDP {
+	if args.UDP || args.Attach {
 		return kUdpModeYes
 	}
 	return kUdpModeNo

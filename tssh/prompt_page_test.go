@@ -178,8 +178,8 @@ func TestCyberpunkThemeRendersProfilePanel(t *testing.T) {
 
 	theme := getCyberpunkTheme()
 	items := []any{
-		&sshHost{Alias: "prod-api", Host: "10.1.1.37", User: "root", Port: "22", GroupLabels: "prod zone-38"},
-		&sshHost{Alias: "prod-worker", Host: "10.1.1.38", User: "root", Port: "22"},
+		&sshHost{Args: &sshArgs{Destination: "prod-api"}, Alias: "prod-api", Host: "10.1.1.37", User: "root", Port: "22", GroupLabels: "prod zone-38"},
+		&sshHost{Args: &sshArgs{Destination: "prod-worker"}, Alias: "prod-worker", Host: "10.1.1.38", User: "root", Port: "22"},
 	}
 
 	output := ansi.Strip(theme.ItemsRenderer(items, 0))
@@ -198,7 +198,7 @@ func TestCyberpunkThemeHidesProfilePanelOnNarrowTerminal(t *testing.T) {
 
 	theme := getCyberpunkTheme()
 	items := []any{
-		&sshHost{Alias: "prod-api", Host: "10.1.1.37", User: "root", Port: "22", GroupLabels: "prod zone-38"},
+		&sshHost{Args: &sshArgs{Destination: "prod-api"}, Alias: "prod-api", Host: "10.1.1.37", User: "root", Port: "22", GroupLabels: "prod zone-38"},
 	}
 
 	output := ansi.Strip(theme.ItemsRenderer(items, 0))

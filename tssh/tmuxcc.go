@@ -32,11 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/trzsz/iterm2"
 )
-
-var iterm2Session *iterm2.Session
 
 func tmuxDebug(format string, a ...any) {
 	if !enableDebugLogging {
@@ -46,7 +42,7 @@ func tmuxDebug(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
 	buf := fmt.Appendf(nil, "\r\033[0;36mdebug:\033[0m %s\033[K\r\n", msg)
 
-	if iterm2Session != nil && iterm2Session.Inject(buf) == nil {
+	if iterm2Session := getIterm2Session(); iterm2Session != nil && iterm2Session.Inject(buf) == nil {
 		return
 	}
 
@@ -54,13 +50,14 @@ func tmuxDebug(format string, a ...any) {
 }
 
 func isRunningTmuxIntegration() bool {
+	iterm2Session := getIterm2Session()
 	if iterm2Session == nil {
 		return false
 	}
 
 	tmux, err := iterm2Session.IsTmuxIntegrationSession()
 	if err != nil {
-		if !iterm2Session.GetApp().IsClosed() {
+		if enableDebugLogging && !iterm2Session.GetApp().IsClosed() {
 			tmuxDebug("check tmux integration failed: %v", err)
 		}
 		return false
@@ -75,19 +72,26 @@ func logToTmuxIntegration(buf []byte, paneId string) bool {
 		return true
 	}
 
+	iterm2Session := getIterm2Session()
+	if iterm2Session == nil {
+		return false
+	}
+
 	cmd := fmt.Sprintf("run-shell 'echo %s | base64 -d >#{pane_tty}'", base64.StdEncoding.EncodeToString(buf))
 	if _, err := iterm2Session.RunTmuxCommand(cmd, 0.3); err != nil {
 		tmuxDebug("run tmux command [%s] failed: %v", cmd, err)
-		if iterm2Session != nil && iterm2Session.Inject(buf) == nil {
-			return true
-		}
-		return false
+		return iterm2Session.Inject(buf) == nil
 	}
 
 	return true
 }
 
 func getTmuxPaneIdAndColumns() (string, int) {
+	iterm2Session := getIterm2Session()
+	if iterm2Session == nil {
+		return "", 0
+	}
+
 	session, err := iterm2Session.GetApp().GetCurrentTmuxSession()
 	if err != nil {
 		tmuxDebug("get process session failed: %v", err)
@@ -141,6 +145,11 @@ func writeTmuxOutput(output []byte, paneId string) {
 }
 
 func detachTmuxIntegration() {
+	iterm2Session := getIterm2Session()
+	if iterm2Session == nil {
+		return
+	}
+
 	_, _ = doWithTimeout(func() (string, error) {
 		return iterm2Session.RunTmuxCommand("detach", 0.3) // detach from tmux integration
 	}, 300*time.Millisecond)
@@ -225,11 +234,15 @@ func handleAndDecodeTmuxInput(buf []byte) ([]byte, []byte, string, bool) {
 	return input, last, paneId, detach
 }
 
-func handleTmuxDiscardedInput(input []byte) {
+func handleTmuxDiscardedInput(discardedInput []byte, discardedOutputLines, discardedOutputByte uint64) {
+	if len(discardedInput) == 0 || !isRunningTmuxIntegration() {
+		return
+	}
+
 	// iTerm2 expects to receive the %begin %end block
 	now := time.Now().Unix()
 	ack := fmt.Appendf(nil, "%%begin %d 1 1\r\n%%end %d 1 1\r\n", now, now)
-	for _, b := range input {
+	for _, b := range discardedInput {
 		if b == ';' || b == '\r' {
 			_, _ = os.Stderr.Write(ack)
 		}

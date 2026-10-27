@@ -31,7 +31,11 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/trzsz/iterm2"
 )
+
+const kDefaultSshSkHelperPath = "/usr/lib/openssh/ssh-sk-helper"
 
 func isRemoteSshEnv(pid int) bool {
 	for range 1000 {
@@ -93,5 +97,10 @@ func getIterm2Manager() terminalManager {
 	return nil
 }
 
-func initIterm2Session() {
+func getIterm2Session() *iterm2.Session {
+	return nil
+}
+
+func shouldPauseReconnect() (bool, string) {
+	return false, ""
 }

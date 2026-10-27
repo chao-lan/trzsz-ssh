@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,6 +60,9 @@ const (
 	kExitCodeStdinFailed = 21
 	kExitCodeTrzszFailed = 22
 	kExitCodeOpenSession = 23
+	kExitCodeReconnect   = 24
+	kExitCodeAttachFail  = 25
+	kExitCodeCanceled    = 26
 
 	kExitCodeToolsError  = 101
 	kExitCodeTrzPreError = 102
@@ -73,6 +77,8 @@ const (
 	kExitCodeKeepAlive   = 205
 	kExitCodeSignalKill  = 206
 	kExitCodeTmuxDetach  = 207
+	kExitCodeUdpDetach   = 208
+	kExitCodeMasterExit  = 209
 )
 
 var debugLogFile *os.File
@@ -145,9 +151,6 @@ func writeDebugLog(msec int64, host, log string) {
 		}
 		if _, err := debugLogFile.WriteString(line); err != nil {
 			return false, fmt.Errorf("write debug log to [%s] failed: %v", debugLogFileName, err)
-		}
-		if err := debugLogFile.Sync(); err != nil {
-			return false, fmt.Errorf("sync debug log to [%s] failed: %v", debugLogFileName, err)
 		}
 		return true, nil
 	}()
@@ -535,8 +538,55 @@ func convertSshTime(str string) (uint32, error) {
 	return total, nil
 }
 
+func formatSshTime(seconds uint32) string {
+	if seconds == 0 {
+		return "0s"
+	}
+
+	units := []struct {
+		suffix byte
+		value  uint32
+	}{
+		{'w', 7 * 24 * 60 * 60},
+		{'d', 24 * 60 * 60},
+		{'h', 60 * 60},
+		{'m', 60},
+		{'s', 1},
+	}
+
+	// Estimate the maximum length (e.g., "1w2d3h4m5s" is only about 10 characters).
+	// Appending directly to a byte slice is faster than using strings.Builder or fmt.Sprintf.
+	var buf []byte
+
+	for _, u := range units {
+		if seconds >= u.value {
+			val := seconds / u.value
+			seconds %= u.value
+			buf = strconv.AppendUint(buf, uint64(val), 10)
+			buf = append(buf, u.suffix)
+		}
+	}
+
+	return string(buf)
+}
+
+var (
+	openSshOnce  sync.Once
+	openSshPath  string
+	openSshMajor int
+	openSshMinor int
+	openSshErr   error
+)
+
 // getOpenSSH returns a usable OpenSSH binary path and its (major, minor) version.
 func getOpenSSH() (string, int, int, error) {
+	openSshOnce.Do(func() {
+		openSshPath, openSshMajor, openSshMinor, openSshErr = findOpenSSH()
+	})
+	return openSshPath, openSshMajor, openSshMinor, openSshErr
+}
+
+func findOpenSSH() (string, int, int, error) {
 	re := regexp.MustCompile(`OpenSSH.*?_(\d+)\.(\d+)`)
 
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
@@ -568,4 +618,93 @@ func getOpenSSH() (string, int, int, error) {
 	}
 
 	return "", 0, 0, fmt.Errorf("no usable ssh found in PATH")
+}
+
+func lookupHostWithTimeout(host string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return addrs, nil
+}
+
+func wildcardToRegexp(pattern string) string {
+	var buf strings.Builder
+	for _, c := range pattern {
+		switch c {
+		case '*':
+			buf.WriteString(".*")
+		case '?':
+			buf.WriteByte('.')
+		case '(', ')', '[', ']', '{', '}', '.', '+', ',', '-', '^', '$', '|', '\\':
+			buf.WriteByte('\\')
+			buf.WriteRune(c)
+		default:
+			buf.WriteRune(c)
+		}
+	}
+	return buf.String()
+}
+
+// newFileUnlinker returns a thread-safe, idempotent cleanup function
+// that closes the provided resource and safely unlinks the Unix socket file.
+func newFileUnlinker(path string, closer io.Closer) func() (bool, error) {
+	var once sync.Once
+	var removed bool
+	var closeErr error
+
+	// Snapshot the file information at creation time to prevent
+	// accidental unlinking if the file is replaced later.
+	createdInfo, err := os.Stat(path)
+	if err != nil {
+		warning("stat created file [%s] failed: %v", path, err)
+	}
+
+	// Disable automatic unlinking so cleanup can verify the file identity first.
+	if unixListener, ok := closer.(*net.UnixListener); ok && unixListener != nil {
+		unixListener.SetUnlinkOnClose(false)
+	}
+
+	cleanup := func() (bool, error) {
+		once.Do(func() {
+			// 1. Close the resource first.
+			if closer != nil {
+				closeErr = closer.Close()
+			}
+
+			// 2. If we couldn't get the initial stat, it's unsafe to unlink.
+			if createdInfo == nil {
+				return
+			}
+
+			// 3. Verify the file identity (Inode check) before unlinking.
+			currentInfo, err := os.Stat(path)
+			if err != nil { // File might already be gone, which is fine.
+				return
+			}
+			if !os.SameFile(createdInfo, currentInfo) {
+				debug("file [%s] replaced since creation; skipping unlink", path)
+				return
+			}
+
+			// 4. Perform the actual unlinking.
+			if err := os.Remove(path); err != nil {
+				warning("unlink file [%s] failed: %v", path, err)
+				return
+			}
+			removed = true
+			debug("unlink file [%s] successful", path)
+		})
+		return removed, closeErr
+	}
+
+	// Return the cleanup function to be used with defer.
+	return cleanup
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

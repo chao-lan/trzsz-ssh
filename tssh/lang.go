@@ -46,6 +46,7 @@ var english = map[string]string{
 	"console/send_char": "Send the escape character '{0}' ( {0} : Enter '{0}' )",
 	"console/suspend":   "Suspend the current SSH process ( ^Z : Ctrl + Z )",
 	"console/terminate": "Terminate the current SSH session ( . : Exit / Kill )",
+	"console/detach":    "Detach the current SSH session ( d : Detach )",
 	"console/notes":     "↑/↓/j/k Move • Enter Select • q Quit",
 }
 
@@ -65,6 +66,7 @@ var chinese = map[string]string{
 	"console/send_char": "发送转义字符 '{0}' ( {0} : 输入 '{0}' )",
 	"console/suspend":   "暂停当前 SSH 进程 ( ^Z : Ctrl + Z )",
 	"console/terminate": "退出当前 SSH 会话 ( . : Exit / Kill )",
+	"console/detach":    "分离当前 SSH 会话 ( d : Detach )",
 	"console/notes":     "↑/↓/j/k 移动 • Enter 选择 • q 退出",
 }
 
@@ -86,7 +88,7 @@ func chooseLanguage() {
 	case "":
 		break
 	default:
-		warning("Language [%s] is not support yet, English will be used by default.", userConfig.language)
+		warning("Language [%s] is not supported yet, English will be used by default.", userConfig.language)
 	}
 
 	language := promptList("Please choose your preferred language", "", []string{"English", "简体中文"})
@@ -99,7 +101,7 @@ func chooseLanguage() {
 		userConfig.language = "chinese"
 	}
 
-	path := getTsshConfigPath(true)
+	path := createTsshConfigPath()
 	if err := writeLanguage(path, language); err != nil {
 		warning("write language [%s] to %s failed: %v", language, path, err)
 		return

@@ -71,10 +71,10 @@ func saveHostToConfig(args *sshArgs, sshConn *sshConnection) error {
 
 	debug("Attempting to save host: user=%s, host=%s, port=%s, group=%s", user, host, port, args.Group)
 
-	existingHost := findHostInConfig(host)
+	existingHost := findHostInConfig(args, host)
 	if existingHost != "" {
 		// Check if configuration really needs to be updated
-		if needsHostUpdate(existingHost, user, host, port, args.Group) {
+		if needsHostUpdate(args, existingHost, user, host, port, args.Group) {
 			debug("Host '%s' configuration changed, updating", existingHost)
 			return updateHostInConfig(existingHost, user, host, port, args.Group)
 		} else {
@@ -87,8 +87,8 @@ func saveHostToConfig(args *sshArgs, sshConn *sshConnection) error {
 	return addHostToConfig(user, host, port, args.Group)
 }
 
-func findHostInConfig(host string) string {
-	loadSshConfig()
+func findHostInConfig(args *sshArgs, host string) string {
+	loadSshConfig(args)
 
 	for _, h := range userConfig.allHosts {
 		// Check both Host and Alias for exact match
@@ -269,13 +269,13 @@ func getConfigPath() string {
 	return filepath.Join(userHomeDir, ".ssh", "config")
 }
 
-func loadSshConfig() {
-	getAllHosts()
+func loadSshConfig(args *sshArgs) {
+	getAllHosts(args)
 }
 
 // getExistingHostConfig gets existing host configuration information
-func getExistingHostConfig(alias string) *sshHost {
-	loadSshConfig()
+func getExistingHostConfig(args *sshArgs, alias string) *sshHost {
+	loadSshConfig(args)
 
 	for _, h := range userConfig.allHosts {
 		if h.Alias == alias {
@@ -286,8 +286,8 @@ func getExistingHostConfig(alias string) *sshHost {
 }
 
 // needsHostUpdate checks if host configuration needs to be updated
-func needsHostUpdate(alias, user, host, port, group string) bool {
-	existingConfig := getExistingHostConfig(alias)
+func needsHostUpdate(args *sshArgs, alias, user, host, port, group string) bool {
+	existingConfig := getExistingHostConfig(args, alias)
 	if existingConfig == nil {
 		return true // Configuration does not exist, needs to be added
 	}
