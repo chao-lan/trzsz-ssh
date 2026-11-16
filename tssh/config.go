@@ -32,6 +32,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -892,7 +893,7 @@ func decodeSecret(secret string) (string, error) {
 	}
 	nonceSize := aesGCM.NonceSize()
 	if len(cipherSecret) < nonceSize {
-		return "", fmt.Errorf("too short")
+		return "", errors.New("too short")
 	}
 	plainSecret, err := aesGCM.Open(nil, cipherSecret[:nonceSize], cipherSecret[nonceSize:], nil)
 	if err != nil {

@@ -588,6 +588,28 @@ trzsz-ssh ( tssh ) 与 [tsshd](https://github.com/trzsz/tsshd) 一起，适用�
       # 以上 ExpectSendPass? 和 ExpectSendText? 只要二选一即可，若都配置则 ExpectSendPass? 的优先级更高
   ```
 
+- 支持配置 `ExpectRegex?`，以 Go 正则表达式的方式匹配服务器的原始输出，并捕获动态内容供后续输入引用，用法如下：
+
+  ```
+  Host bastion
+      #!! ExpectCount 3  # 配置自动交互的次数，默认是 0 即无自动交互
+      #!! ExpectRegex1 Opt>  # 配置第一个自动交互的正则表达式，与 ExpectPattern? 二选一，若都配置则优先使用 ExpectRegex?
+      #!! ExpectSendText1 ls 192.0.2.10\r  # 执行查询命令
+      #!! ExpectRegex2 (\d{3}):.*192\.0\.2\.10  # 匹配输出并捕获目标服务器的编号（如 006）
+      #!! ExpectSendText2 q\r  # 退出查询结果
+      #!! ExpectRegex3 Shell\]\$  # 匹配 Shell 提示符
+      #!! ExpectSendText3 open %1\r  # 引用 ExpectRegex2 的第一个捕获组，自动输入编号
+  ```
+
+  - `ExpectRegex?` 使用 Go 正则表达式语法，匹配服务器返回的原始输出，而不是 `--debug` 显示的转义后的输出。
+  - 捕获组编号在所有 `ExpectRegex?` 匹配之间全局递增，例如第一次匹配分配 `%1` 至 `%3`，第二次匹配从 `%4` 开始，编号一旦分配就不会改变。
+  - 编号大于 9 时使用 `%{10}` 这种写法，`%1` 与 `%{1}` 等价。
+  - 命名捕获组在所有匹配之间全局保留，可用 `%{name}` 引用，例如 `(?P<id>\d{3})`。跨步骤引用时建议使用命名捕获。
+  - `ExpectRegex?` 支持展开 `%h`、`%p`、`%r`、`%n`、`%l`、`%L`、`%j`，`%%` 表示一个普通的 `%`。展开值会作为字面量文本处理，其中的正则元字符会自动转义，例如 `%n` 展开为 `192.0.2.10` 时会转义为 `192\.0\.2\.10`，无需手写转义。
+  - 若同时配置了 `ExpectRegex?` 和 `ExpectPattern?`，则优先使用 `ExpectRegex?`。
+  - 若目标服务器的 IP 需要在命令行中指定，可以将 `Host` 别名配置为目标 IP，将 `HostName` 配置为堡垒机地址，然后在 `ExpectSendText?` 中使用 `%n`。
+  - 如果服务器返回的是 TUI 列表（使用 ESC 光标控制而不是换行），`.*` 会跨行匹配；可以用 `[^\x1b\r\n]*` 限定在同一行内。
+
 - 在每个 `ExpectPattern?` 匹配之前，如果遇到可选的匹配则自动输入，用法如下：
 
   ```
@@ -1098,6 +1120,7 @@ Host xxx
     #!! UdpMTU 1400
     #!! UdpSessionAttach no
     #!! UdpSessionName xxx
+    #!! UdpCompression zstd
 ```
 
 - `UdpMode`: `no` (默认为`no`: tssh 工作在 TCP 模式), `yes` (默认协议: `QUIC`), `QUIC` ([QUIC](https://github.com/quic-go/quic-go) 协议：速度更快), `KCP` ([KCP](https://github.com/xtaci/kcp-go) 协议：延迟更低).
@@ -1125,6 +1148,8 @@ Host xxx
 - `UdpSessionAttach`: 默认为 `no`。配置为 `yes` 时，允许附加到服务器上已存在的会话；同时，本次登录的会话也会运行在可附加模式下，支持后续在其他设备或网络下重新登录时附加。
 
 - `UdpSessionName`: 自定义会话名称。仅在 `UdpSessionAttach` 配置为 `yes` 或通过 `--attach` 参数登录时生效。若服务器端已存在该名称的会话，将直接附加；若不存在，则以此名称创建新会话，供后续登录时自动附加。
+
+- `UdpCompression`：设置为 `zstd` 时，启用 UDP 会话输出的 Zstandard 压缩。服务端支持时默认使用 `zstd`。设置为 `none` 可禁用压缩。
 
 ### UDP 多路复用
 
